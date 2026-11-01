@@ -187,8 +187,8 @@ else {
     finally {
         stopping = true;
         polling.abort();
-        await local?.close();
         await bridge.stop();
+        await local?.close();
         await unlink(lockPath);
     }
 }

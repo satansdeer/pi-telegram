@@ -29,6 +29,7 @@
   "scripts": {
     "omp": "node --experimental-strip-types omp/main.ts",
     "omp:check": "node --experimental-strip-types omp/main.ts --check",
+    "omp:restart": "launchctl kill SIGTERM gui/$(id -u)/com.omp.workspace",
     "test:omp": "node --experimental-strip-types --test tests/omp-*.test.ts",
     "test": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-concurrency=4 --test-reporter=dot tests/*.test.ts",
     "test:low-concurrency": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-concurrency=2 --test-reporter=dot tests/*.test.ts",

@@ -340,8 +340,9 @@ test("Workspace restart reports interrupted admission without replaying a prompt
     const update = h.update("do not replay", threadId);
     await h.bridge.handle(update);
     await h.until(() => h.sessions.get(threadId)!.prompts.length === 1);
-    // Snapshot the durable crash boundary, then let the first in-memory process stop.
+    // Preserve the durable crash boundary, then unblock this fixture without mutating the copied snapshot.
     await copyFile(join(directory, "state.json"), join(recoveredDirectory, "state.json"));
+    await h.sessions.get(threadId)!.abort();
     await h.bridge.stop();
     await recovered.bridge.init();
     await recovered.reply("Its outcome may be ambiguous", threadId);
@@ -409,6 +410,34 @@ test("Workspace keeps execution separate from failed reply delivery and never re
   } finally {
     await h.bridge.stop();
     await resumed?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace shutdown drains an accepted turn before stopping its session", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-drain-"));
+  const statePath = join(directory, "state.json");
+  const h = new Harness(statePath);
+  let session: FakeSession | undefined;
+  try {
+    await h.bindWorkspace();
+    const thread = await h.create();
+    await h.dispatch("finish before restart", thread);
+    await h.until(() => h.sessions.get(thread)?.prompts.length === 1);
+    session = h.sessions.get(thread)!;
+
+    const stopping = h.bridge.stop();
+    await scheduler.yield();
+    assert.equal(session.stopped, false, "shutdown must not stop a session with an accepted turn");
+
+    session.complete("finished before restart");
+    await stopping;
+    assert.equal(session.stopped, true);
+    assert.ok(h.sent.some((sent) => sent.message_thread_id === thread && sent.text === "finished before restart"));
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).admissions.length, 0);
+  } finally {
+    if (session && !session.stopped) await session.abort();
+    await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
   }
 });

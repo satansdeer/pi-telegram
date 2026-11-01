@@ -809,14 +809,14 @@ export class WorkspaceBridge {
   }
   async stop(): Promise<void> {
     this.stopping = true;
-    for (const port of this.terminals.keys()) this.detach(port);
     await this.admitting;
     await this.attaching;
+    while (this.jobs.size) await Promise.allSettled([...this.jobs]);
+    for (const port of this.terminals.keys()) this.detach(port);
     const opened = await Promise.allSettled([...this.sessions.values()]);
     const shutdowns = await Promise.allSettled(opened.flatMap((result) => result.status === "fulfilled" ? [result.value.stop()] : []));
     const failures = [...opened, ...shutdowns].filter((result) => result.status === "rejected").map((result) => result.reason);
     if (failures.length) throw new AggregateError(failures, "OMP child shutdown is uncertain; supervisor ownership must be retained");
-    while (this.jobs.size) await Promise.allSettled([...this.jobs]);
     await this.writing;
   }
 }

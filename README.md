@@ -64,11 +64,11 @@ Different topics run concurrently; a second prompt in an active topic is rejecte
 
 Telegram, OMP, and the local file cannot commit atomically. After a crash, unfinished updates are reported, **not replayed**; topic creation and prompts are never automatically retried. If initialization stopped before recording the OMP identity, inspect that chat's transcript directory and reconcile the binding manually rather than deleting state or creating a replacement.
 
-The daemon owns `daemon.lock`. Graceful shutdown drains accepted work; uncertain child shutdown retains ownership. After an unclean exit, inspect the recorded PID and any surviving OMP child before manually removing a stale lock. Do not remove it while either is alive.
+The daemon owns `daemon.lock`. Graceful shutdown stops polling, drains every accepted update through reply delivery and durable completion, then disconnects terminals and stops daemon-owned sessions. Uncertain child shutdown retains ownership. After an unclean exit, inspect the recorded PID and any surviving OMP child before manually removing a stale lock. Do not remove it while either is alive.
 
-For the installed macOS service: label `com.omp.workspace`, plist `~/Library/LaunchAgents/com.omp.workspace.plist`, logs `~/Library/Logs/omp-workspace{,.error}.log`. It sources the existing private `~/.config/omp-remote-control.env`. The previous `com.omp.remote-control` plist is retained for rollback; stop one before starting the other. Separate IRC services are unchanged.
+For the installed macOS service: label `com.omp.workspace`, plist `~/Library/LaunchAgents/com.omp.workspace.plist`, logs `~/Library/Logs/omp-workspace{,.error}.log`. It sources the existing private `~/.config/omp-remote-control.env`. Its `KeepAlive` policy starts the replacement after a graceful exit. After `npm run build`, use `npm run omp:restart`; it sends `SIGTERM`, allowing the current Telegram reply to finish before the daemon exits. Do not use `launchctl kickstart -k` for routine deploys because it force-stops in-flight work. The previous `com.omp.remote-control` plist is retained for rollback; stop one before starting the other. Separate IRC services are unchanged.
 
-Development checks: `npm run test:omp`, `npm run typecheck`, `npm run build`. Build again before restarting the installed service; it runs `dist/omp/main.js`, not TypeScript source.
+Development checks: `npm run test:omp`, `npm run typecheck`, `npm run build`. The installed service runs `dist/omp/main.js`, not TypeScript source.
 
 ## Upstream Pi adapter
 
