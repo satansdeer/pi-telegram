@@ -11,6 +11,7 @@ export declare class OmpSession {
     private readonly directory;
     private readonly onUi;
     private turn?;
+    private sidecar?;
     private failure?;
     private exit?;
     private sequence;
@@ -28,12 +29,14 @@ export declare class OmpSession {
     ready(): Promise<Record<string, unknown>>;
     state(): Promise<Record<string, unknown>>;
     prompt(text: string): Promise<string>;
+    btw(question: string): Promise<string>;
     abort(): Promise<void>;
     answer(id: string, response: Record<string, unknown>): Promise<void>;
     stop(): Promise<void>;
     private request;
     private send;
     private handleFrame;
+    private handleBtwRecord;
     private finishTurn;
     private fail;
 }

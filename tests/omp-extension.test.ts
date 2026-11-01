@@ -18,6 +18,7 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
   const commands = new Map<string, (args: string, ctx: TerminalContext) => Promise<void>>();
   const notifications: { message: string; type?: string }[] = [];
   const sent: string[] = [];
+  const sidecarPrompts: string[] = [];
   const links: Link[] = [];
   const deferred = Promise.withResolvers<void>();
   const identity = { sessionId: "terminal-session", sessionFile: "/sessions/terminal.jsonl", cwd: "/project" };
@@ -34,6 +35,10 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
     isIdle: () => idle,
     hasPendingMessages: () => queued,
     abort() { aborts++; },
+    async runEphemeralTurn({ promptText }) {
+      sidecarPrompts.push(promptText);
+      return { replyText: "sidecar answer" };
+    },
     ui: { notify(message, type) { notifications.push({ message, type }); } },
   };
   const host: TerminalHost = {
@@ -70,7 +75,7 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
     return listeners.get(event)?.({ type: event, ...data }, ctx);
   }
   return {
-    identity, notifications, sent, links, ctx,
+    identity, notifications, sent, sidecarPrompts, links, ctx,
     get aborts() { return aborts; },
     get attempts() { return attempts; },
     setUnavailable(value: boolean) { unavailable = value; },
@@ -112,6 +117,10 @@ test("terminal attachment is idempotent, reserves admission before dispatch, and
   assert.deepEqual(terminal.sent, ["remote task"]);
   assert.equal((await terminal.remote("state") as { isStreaming: boolean }).isStreaming, true);
   await assert.rejects(terminal.remote("prompt", { text: "another remote task" }), /busy/);
+  assert.equal(await terminal.remote("btw", { text: "what is happening?" }), "sidecar answer");
+  assert.match(terminal.sidecarPrompts[0]!, /^<btw>\nEphemeral side question/);
+  assert.match(terminal.sidecarPrompts[0]!, /Question:\nwhat is happening\?\n<\/btw>$/);
+  assert.deepEqual(terminal.sent, ["remote task"], "a /btw question must not enter the main transcript");
   assert.deepEqual(terminal.emit("input", { text: "local task", source: "interactive" }), { handled: true });
   assert.deepEqual(terminal.emit("input", { text: "concurrent RPC task", source: "rpc" }), { handled: true });
   assert.match(terminal.notifications.at(-1)!.message, /telegram-disconnect.*\/abort/);

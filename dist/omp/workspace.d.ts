@@ -15,6 +15,7 @@ export interface UiRequest {
 }
 export interface SessionPort {
     prompt(text: string): Promise<string>;
+    btw(text: string): Promise<string>;
     abort(): Promise<void>;
     state(): Promise<Record<string, unknown>>;
     answer(id: string, response: Record<string, unknown>): Promise<void>;
@@ -81,7 +82,9 @@ export declare class WorkspaceBridge {
     private onUi;
     private startTyping;
     private reply;
+    private replySidecar;
     private send;
+    private sendSidecar;
     private complete;
     private save;
     private track;

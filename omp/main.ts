@@ -106,6 +106,11 @@ if (process.argv.includes("--check")) {
           if (typeof state !== "object" || state === null || Array.isArray(state)) throw new Error("Invalid terminal session state");
           return state as Record<string, unknown>;
         },
+        async btw(text) {
+          const result = await peer.request("btw", { text });
+          if (typeof result !== "string") throw new Error("Attached OMP terminal returned an invalid /btw response");
+          return result;
+        },
         async prompt(text) {
           const response = await peer.request("prompt", { text });
           if (typeof response !== "string") throw new Error("Invalid terminal response");

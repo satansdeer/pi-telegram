@@ -42,6 +42,11 @@ export interface TerminalContext {
     isIdle(): boolean;
     hasPendingMessages(): boolean;
     abort(): void;
+    runEphemeralTurn?(options: {
+        promptText: string;
+    }): Promise<{
+        replyText: string;
+    }>;
     ui: {
         notify(message: string, type?: "info" | "warning" | "error"): void;
     };

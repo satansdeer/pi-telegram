@@ -24,6 +24,7 @@ if (!resume && !continued) writeFileSync(sessionFile, JSON.stringify({type: "ses
 const send = frame => process.stdout.write(JSON.stringify(frame) + "\n");
 const reply = (frame, data = {}) => send({type: "response", id: frame.id, command: frame.type, success: true, data});
 let active;
+let btw;
 function finish(text, status = "completed") {
   const current = active;
   active = undefined;
@@ -54,6 +55,16 @@ input.on("line", line => {
       active.reported = true;
       send({type: "extension_ui_request", id: "ui-" + frame.id, method: "input", prompt: frame.message});
     }
+  } else if (frame.type === "btw") {
+    const now = Date.now();
+    btw = {id: "btw-" + frame.id, leafId: null, question: frame.question, answer: "", status: "running", createdAt: now, updatedAt: now};
+    send({type: "btw_record", record: btw});
+    reply(frame, {record: btw});
+    btw = frame.question === "fail-sidecar"
+      ? {...btw, status: "error", error: "sidecar provider failed", updatedAt: Date.now()}
+      : {...btw, status: "complete", answer: "side:" + frame.question, updatedAt: Date.now()};
+    send({type: "btw_record", record: btw});
+    btw = undefined;
   } else if (frame.type === "extension_ui_response" && active) {
     if (frame.cancelled) finish(null, "aborted");
     else finish("final:" + active.message);
@@ -92,6 +103,10 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     void first.then(() => { settled = true; }, () => { settled = true; });
     assert.equal((await session.state()).isStreaming, true);
     assert.equal(settled, false, "a nonterminal agent_end and early result must not release the turn");
+    assert.equal(await session.btw("what is happening?"), "side:what is happening?");
+    assert.equal(settled, false, "an ephemeral side question must not settle the main turn");
+    await assert.rejects(session.btw("fail-sidecar"), /sidecar provider failed/);
+    assert.equal(session.busy, true);
     await session.answer(request.id, { value: "finish" });
     assert.equal(await first, "final:first");
     assert.equal(session.busy, false);

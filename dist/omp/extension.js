@@ -33,11 +33,22 @@ function parameters(params, keys) {
     if (Object.keys(params).some(key => !keys.includes(key)))
         throw new Error("Unexpected Telegram request parameters.");
 }
+function btwPrompt(question) {
+    return `<btw>
+Ephemeral side question for current interactive session.
+Answer briefly, directly; use conversation context already provided.
+NEVER use tools.
+NEVER ask follow-up questions.
+Question:
+${question}
+</btw>`;
+}
 export default function telegramExtension(pi, connect = connectWorkspace) {
     let context;
     let connection;
     let pending;
     let generation = 0;
+    let sidecar = false;
     let activeOperation = false;
     let optedOut = false;
     let suspended = false;
@@ -119,7 +130,7 @@ export default function telegramExtension(pi, connect = connectWorkspace) {
             const ctx = currentContext(current);
             if (method === "state") {
                 parameters(params, []);
-                return { ...identityOf(ctx), isStreaming: !!pending || activeOperation || !ctx.isIdle() || ctx.hasPendingMessages() };
+                return { ...identityOf(ctx), isStreaming: !!pending || sidecar || activeOperation || !ctx.isIdle() || ctx.hasPendingMessages() };
             }
             if (method === "attached") {
                 acceptAttachment(current, params);
@@ -133,6 +144,26 @@ export default function telegramExtension(pi, connect = connectWorkspace) {
                 parameters(params, []);
                 ctx.abort();
                 return;
+            }
+            if (method === "btw") {
+                parameters(params, ["text"]);
+                if (typeof params.text !== "string" || !params.text.trim())
+                    throw new Error("Telegram /btw question must not be empty.");
+                if (!ctx.runEphemeralTurn)
+                    throw new Error("This OMP terminal does not support ephemeral /btw turns.");
+                if (sidecar)
+                    throw new Error("An OMP /btw question is already running.");
+                sidecar = true;
+                try {
+                    const result = await ctx.runEphemeralTurn({ promptText: btwPrompt(params.text) });
+                    currentContext(current);
+                    if (typeof result.replyText !== "string")
+                        throw new Error("OMP /btw returned an invalid response.");
+                    return result.replyText;
+                }
+                finally {
+                    sidecar = false;
+                }
             }
             if (method !== "prompt")
                 throw new Error(`Unsupported Telegram terminal method: ${method}`);

@@ -30,6 +30,7 @@ export interface TerminalContext {
   isIdle(): boolean;
   hasPendingMessages(): boolean;
   abort(): void;
+  runEphemeralTurn?(options: { promptText: string }): Promise<{ replyText: string }>;
   ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
 }
 
@@ -85,11 +86,23 @@ function parameters(params: Record<string, unknown>, keys: string[]): void {
   if (Object.keys(params).some(key => !keys.includes(key))) throw new Error("Unexpected Telegram request parameters.");
 }
 
+function btwPrompt(question: string): string {
+  return `<btw>
+Ephemeral side question for current interactive session.
+Answer briefly, directly; use conversation context already provided.
+NEVER use tools.
+NEVER ask follow-up questions.
+Question:
+${question}
+</btw>`;
+}
+
 export default function telegramExtension(pi: TerminalHost, connect: typeof connectWorkspace = connectWorkspace): void {
   let context: TerminalContext | undefined;
   let connection: Connection | undefined;
   let pending: Turn | undefined;
   let generation = 0;
+  let sidecar = false;
   let activeOperation = false;
   let optedOut = false;
   let suspended = false;
@@ -165,7 +178,7 @@ export default function telegramExtension(pi: TerminalHost, connect: typeof conn
       const ctx = currentContext(current);
       if (method === "state") {
         parameters(params, []);
-        return { ...identityOf(ctx), isStreaming: !!pending || activeOperation || !ctx.isIdle() || ctx.hasPendingMessages() };
+        return { ...identityOf(ctx), isStreaming: !!pending || sidecar || activeOperation || !ctx.isIdle() || ctx.hasPendingMessages() };
       }
       if (method === "attached") { acceptAttachment(current, params); return; }
       if (method === "answer") throw new Error("Telegram /answer is unsupported for attached terminal sessions. Answer interactive dialogs in the local OMP terminal.");
@@ -174,6 +187,21 @@ export default function telegramExtension(pi: TerminalHost, connect: typeof conn
         parameters(params, []);
         ctx.abort();
         return;
+      }
+      if (method === "btw") {
+        parameters(params, ["text"]);
+        if (typeof params.text !== "string" || !params.text.trim()) throw new Error("Telegram /btw question must not be empty.");
+        if (!ctx.runEphemeralTurn) throw new Error("This OMP terminal does not support ephemeral /btw turns.");
+        if (sidecar) throw new Error("An OMP /btw question is already running.");
+        sidecar = true;
+        try {
+          const result = await ctx.runEphemeralTurn({ promptText: btwPrompt(params.text) });
+          currentContext(current);
+          if (typeof result.replyText !== "string") throw new Error("OMP /btw returned an invalid response.");
+          return result.replyText;
+        } finally {
+          sidecar = false;
+        }
       }
       if (method !== "prompt") throw new Error(`Unsupported Telegram terminal method: ${method}`);
       parameters(params, ["text"]);

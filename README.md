@@ -53,11 +53,12 @@ Run `/telegram-disconnect` locally to detach and remove the terminal from `/runn
 - `/running`: live terminal session IDs, working directories, busy/idle state, and topic attachments.
 - `/attach <full-session-id>`: create or reuse a topic for that exact registered terminal.
 - `/status`: this topic's designation, activity, and pending UI request IDs.
+- `/btw <question>`: run OMP's ephemeral side-turn pipeline against the current context, including an in-flight main answer. The question and answer are not appended to the main session transcript. Telegram renders each answer as a quoted `💭 Sidecar` message.
 - `/abort`: abort only this topic's active turn.
 - For daemon-owned sessions, `/answer <request-id> <JSON object>` or `/cancel <request-id>` resolves OMP UI requests in the same topic. For example, `/answer request-1 {"confirmed":true}`. Secret input and attached-terminal dialogs must use the local terminal.
 - `/help`: command reference. Other slash commands and attachments are not forwarded to OMP.
 
-Different topics run concurrently; a second prompt in an active topic is rejected, not queued. While OMP handles a prompt, the daemon immediately sends and refreshes Telegram's typing state in that exact topic, then stops it before delivering the final text. Typing-state failures are best effort and do not fail the prompt. Final text is chunked into that exact topic. This daemon does not port the upstream Pi extension's media, previews, or menus.
+Different topics run concurrently; a second prompt in an active topic is rejected, not queued. `/btw` uses a separate side-turn lane, so one side question can run while the main turn is active. While OMP handles either kind of prompt, the daemon immediately sends and refreshes Telegram's typing state in that exact topic, then stops it before delivering the final text. Typing-state failures are best effort and do not fail the prompt. Final text is chunked into that exact topic. This daemon does not port the upstream Pi extension's media, previews, or menus.
 
 `state.json` stores the exact group/topic/chat/session identity, terminal ownership, poll offset, and unfinished admissions with mode `0600`. Daemon-owned transcripts live under `sessions/<chat-id>/`; attached terminals retain their original transcript paths. A restart resumes daemon-owned transcripts exactly, while terminal-owned topics stay offline until explicitly reconnected. Neither path silently substitutes a fresh session. Keep this directory when upgrading.
 

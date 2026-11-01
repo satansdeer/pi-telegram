@@ -26,6 +26,7 @@ export interface UiRequest {
 }
 export interface SessionPort {
   prompt(text: string): Promise<string>;
+  btw(text: string): Promise<string>;
   abort(): Promise<void>;
   state(): Promise<Record<string, unknown>>;
   answer(id: string, response: Record<string, unknown>): Promise<void>;
@@ -71,6 +72,7 @@ const HELP = [
   "/running — list live terminals without creating topics",
   "/attach <full-session-id> — attach that exact live terminal to a topic",
   "/status — show this topic's session and pending UI requests",
+  "/btw <question> — ask an ephemeral side question without adding it to the main chat history",
   "/abort — interrupt this topic's active turn",
   "/answer <request-id> <JSON object> — answer this topic's pending UI request",
   "/cancel <request-id> — cancel this topic's pending UI request",
@@ -94,6 +96,9 @@ function text(value: unknown): value is string {
 }
 function keys(value: Record<string, unknown>, allowed: string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
+}
+function escapeHtml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 async function canonicalFile(path: string): Promise<string> {
   try { return await realpath(path); }
@@ -491,7 +496,7 @@ export class WorkspaceBridge {
       await this.reply(admission, "Workspace bound. Use /running and /attach <full-session-id> for a live terminal, /new [name] to create a chat topic, or /bind inside an existing non-General topic.");
       return;
     }
-    if (!["new", "bind", "running", "attach", "sessions", "status", "abort", "answer", "cancel"].includes(command.name)) throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
+    if (!["new", "bind", "running", "attach", "sessions", "status", "abort", "btw", "answer", "cancel"].includes(command.name)) throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
     this.requireGroup(target);
     if (command.name === "running") {
       if (command.argument) throw new Error("Usage: /running");
@@ -568,6 +573,23 @@ export class WorkspaceBridge {
       return;
     }
     const binding = this.requireBinding(target);
+    if (command.name === "btw") {
+      if (!command.argument) throw new Error("Usage: /btw <question>");
+      const session = await this.session(binding);
+      await this.assertIdentity(binding, session);
+      admission.phase = "running";
+      await this.save();
+      if (binding.external) this.externalRegistration(binding, session);
+      const stopTyping = this.startTyping(target);
+      let output: string;
+      try {
+        output = await session.btw(command.argument);
+      } finally {
+        stopTyping();
+      }
+      await this.replySidecar(admission, output || "OMP completed the side question without a text reply.");
+      return;
+    }
     if (command.name === "status") {
       const requests = [...(this.pending.get(binding.id)?.keys() ?? [])];
       const live = binding.external ? this.sessions.get(binding.id) : undefined;
@@ -729,12 +751,30 @@ export class WorkspaceBridge {
     await this.save();
     await this.send(target, body);
   }
+  private async replySidecar(admission: Admission, body: string): Promise<void> {
+    admission.phase = "delivery";
+    await this.save();
+    await this.sendSidecar(admission.target, body);
+  }
   private async send(target: TelegramTarget, body: string): Promise<void> {
     // Conservative UTF-16 chunks also fit Telegram's 4096-character ceiling.
     for (let start = 0; start < body.length;) {
       let end = Math.min(start + 4096, body.length);
       if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]!)) end--;
       await this.api("sendMessage", { chat_id: target.chatId, ...getTelegramTargetThreadParams(target), text: body.slice(start, end) });
+      start = end;
+    }
+  }
+  private async sendSidecar(target: TelegramTarget, body: string): Promise<void> {
+    for (let start = 0; start < body.length;) {
+      let end = Math.min(start + 4_000, body.length);
+      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]!)) end--;
+      await this.api("sendMessage", {
+        chat_id: target.chatId,
+        ...getTelegramTargetThreadParams(target),
+        text: `💭 <b>Sidecar</b>\n<blockquote>${escapeHtml(body.slice(start, end))}</blockquote>`,
+        parse_mode: "HTML",
+      });
       start = end;
     }
   }

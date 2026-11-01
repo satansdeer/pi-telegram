@@ -65,6 +65,7 @@ export class OmpSession {
     directory;
     onUi;
     turn;
+    sidecar;
     failure;
     exit;
     sequence = 0;
@@ -198,6 +199,35 @@ export class OmpSession {
         }
         return await completion.promise;
     }
+    async btw(question) {
+        if (this.sidecar)
+            throw new Error("An OMP /btw question is already running");
+        if (this.failure)
+            throw this.failure;
+        if (this.stopping)
+            throw new Error("OMP session is stopping");
+        const completion = Promise.withResolvers();
+        void completion.promise.catch(() => undefined);
+        const sidecar = {
+            id: `workspace-${++this.sequence}`, resolve: completion.resolve, reject: completion.reject, settled: false,
+        };
+        this.sidecar = sidecar;
+        try {
+            const response = await this.request("btw", { question }, sidecar.id);
+            if (record(response.data) && record(response.data.record))
+                this.handleBtwRecord(response.data.record);
+        }
+        catch (error) {
+            const failure = error instanceof Error ? error : new Error(String(error));
+            if (!sidecar.settled) {
+                sidecar.settled = true;
+                sidecar.reject(failure);
+            }
+            if (!(failure instanceof OutcomeUnknownError) && this.sidecar === sidecar)
+                this.sidecar = undefined;
+        }
+        return await completion.promise;
+    }
     async abort() { await this.request("abort"); }
     async answer(id, response) {
         await this.send({ ...response, id, type: "extension_ui_response" });
@@ -258,6 +288,8 @@ export class OmpSession {
                 }
             }
         }
+        if (frame.type === "btw_record" && record(frame.record))
+            this.handleBtwRecord(frame.record);
         const turn = this.turn;
         if (frame.type === "agent_start") {
             this.streaming = true;
@@ -305,6 +337,25 @@ export class OmpSession {
             });
         }
     }
+    handleBtwRecord(record) {
+        const sidecar = this.sidecar;
+        if (!sidecar || typeof record.id !== "string")
+            return;
+        if (sidecar.recordId !== undefined && sidecar.recordId !== record.id)
+            return;
+        sidecar.recordId = record.id;
+        if (record.status === "running")
+            return;
+        if (!sidecar.settled) {
+            sidecar.settled = true;
+            if (record.status === "complete" && typeof record.answer === "string")
+                sidecar.resolve(record.answer);
+            else
+                sidecar.reject(errorOf(record.error, `OMP /btw ${String(record.status ?? "failed")}`));
+        }
+        if (this.sidecar === sidecar)
+            this.sidecar = undefined;
+    }
     finishTurn(turn) {
         const local = turn.result?.agentInvoked === false;
         if (turn.failure && !turn.settled) {
@@ -326,6 +377,9 @@ export class OmpSession {
         this.pending.clear();
         this.turn?.reject(this.failure);
         this.turn = undefined;
+        if (this.sidecar && !this.sidecar.settled)
+            this.sidecar.reject(this.failure);
+        this.sidecar = undefined;
         if (this.exit)
             this.streaming = false;
     }

@@ -9,6 +9,7 @@
 - `OMP terminal attachment`: Native `/telegram-connect [name]` creates a Workspace topic for the same live OMP process and existing context; reconnect preserves its topic and transcript. Private authenticated local IPC keeps one bot poller. Busy-turn guards, fresh response capture, and identity fencing prevent mixed sessions. `/telegram-disconnect` leaves local work running; disconnected terminal topics never spawn or resume a replacement. Interactive dialogs stay local.
 - `Telegram-first attachment`: Native main terminals register without creating topics. Owner-only `/running` lists full IDs, folders, activity, and attachments; `/attach <full-session-id>` binds that exact live process and returns its topic link. Concurrent attaches reuse one topic. Daemon restarts rediscover terminals without replaying attachments or prompts; local disconnect opts out while work continues. Managed children stay out of discovery.
 - `OMP activity`: Workspace prompts now send and refresh Telegram's typing state in the exact topic while OMP runs, then stop it before reply delivery. Presence failures remain best effort and never fail or replay the prompt.
+- `OMP sidecar questions`: `/btw <question>` now runs OMP's ephemeral side-turn pipeline against the topic's current context without appending the exchange to the main transcript. Side turns can run alongside the main turn, retain exact session ownership, refresh topic-local typing state, and return escaped quoted `💭 Sidecar` messages.
 
 ## 0.58.3: Typing Cancellation Diagnostics
 
