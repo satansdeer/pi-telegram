@@ -1,5 +1,16 @@
 # Project Context
 
+## OMP Workspace fork
+
+This fork additionally provides an explicit standalone OMP supervisor under
+`omp/`, launched by the operator, not loaded as a Pi extension. It owns one
+Telegram bot poller and one persistent OMP RPC session per group forum topic.
+The Pi extension contracts below remain unchanged and apply to `lib/` and
+`api/`. Never run both entrypoints (or another poller) with the same bot token.
+Workspace routing requires the configured human owner and the exact persisted
+group/topic identity; it must not grant group members access to OMP.
+Keep generated chat IDs distinct from Telegram topic IDs and OMP session IDs.
+
 ## 0. Meta-Protocol Principles
 
 - `Mobile companion boundary`: Telegram extends a running Pi session; it is not a remote terminal, PTY supervisor, process launcher, session browser, or replacement TUI. Never emulate Pi navigation through private internals, ANSI/TTY injection, or a shadow `pi` process. Built-in Telegram controls manage work inside a running session; Pi process termination stays a local Pi/TUI operation, not a terminal command to mirror.

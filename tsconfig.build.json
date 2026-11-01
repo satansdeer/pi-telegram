@@ -13,6 +13,7 @@
   "include": [
     "index.ts",
     "api/**/*.ts",
+    "omp/**/*.ts",
     "lib/**/*.ts"
   ]
 }

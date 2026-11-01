@@ -1,5 +1,52 @@
 # pi-telegram
 
+## OMP Workspace (this fork)
+
+Fork of [`llblab/pi-telegram`](https://github.com/llblab/pi-telegram), with an explicit standalone OMP daemon. A Telegram forum group is the Workspace; each chat is a topic with a generated 12-hex-character ID and its own persistent OMP session. This is **not** the upstream Pi extension. The Pi adapter below remains available separately.
+
+### Setup
+
+1. Enable **Topics** in your Telegram supergroup.
+2. Add your bot as an administrator with **Manage Topics**. Administrative membership also lets it receive ordinary topic messages despite BotFather privacy mode.
+3. Stop any other poller using this bot token, including the old DM controller. Never run both the Pi extension and this daemon with the same token.
+4. Configure a private environment file and source it before launching:
+
+   ```bash
+   export OMP_TELEGRAM_BOT_TOKEN="your-bot-token"
+   export OMP_TELEGRAM_OWNER_ID="your-numeric-user-id"
+   export OMP_WORKSPACE_CWD="$HOME/Workspace"
+   export OMP_BINARY="$HOME/.local/bin/omp"
+   # Optional: OMP_WORKSPACE_STATE_DIR defaults to ~/.config/omp-workspace
+   ```
+
+5. From this checkout, run `npm ci`, `npm run build`, then `npm run omp:check`. Start the compiled daemon with `node dist/omp/main.js`.
+6. As the configured owner, send `/workspace` in the group. Binding verifies a forum supergroup and the bot's topic-management permission; another group cannot take it over.
+7. Send `/new project-name`; wait for **Chat created** in the new `[generated-id] project-name` topic, then send ordinary text there. `/bind [name]` inside an existing non-General topic designates a new session without replacing an existing binding.
+
+Only the configured owner can send prompts or controls. Topic content and OMP output are visible to **every group member**: use a private Workspace with trusted members. Each session has normal local OMP tool access and starts in `OMP_WORKSPACE_CWD`; this is not a sandbox.
+
+### Controls and persistence
+
+- `/sessions`: chat IDs, topic IDs, OMP session IDs, transcript paths, and working directories.
+- `/status`: this topic's designation, activity, and pending UI request IDs.
+- `/abort`: abort only this topic's active turn.
+- `/answer <request-id> <JSON object>` or `/cancel <request-id>`: resolve OMP UI requests in the same topic. For example, `/answer request-1 {"confirmed":true}`. Secret input must use a local terminal.
+- `/help`: command reference. Other slash commands and attachments are not forwarded to OMP.
+
+Different topics run concurrently; a second prompt in an active topic is rejected, not queued. Final text is chunked into that exact topic. This daemon does not port the upstream Pi extension's media, previews, or menus.
+
+`state.json` stores the exact group/topic/chat/session identity, poll offset, and unfinished admissions with mode `0600`; isolated transcripts live under `sessions/<chat-id>/`. A restart resumes the recorded transcript, never silently substitutes a fresh session. Keep this directory when upgrading.
+
+Telegram, OMP, and the local file cannot commit atomically. After a crash, unfinished updates are reported, **not replayed**; topic creation and prompts are never automatically retried. If initialization stopped before recording the OMP identity, inspect that chat's transcript directory and reconcile the binding manually rather than deleting state or creating a replacement.
+
+The daemon owns `daemon.lock`. Graceful shutdown drains accepted work; uncertain child shutdown retains ownership. After an unclean exit, inspect the recorded PID and any surviving OMP child before manually removing a stale lock. Do not remove it while either is alive.
+
+For the installed macOS service: label `com.omp.workspace`, plist `~/Library/LaunchAgents/com.omp.workspace.plist`, logs `~/Library/Logs/omp-workspace{,.error}.log`. It sources the existing private `~/.config/omp-remote-control.env`. The previous `com.omp.remote-control` plist is retained for rollback; stop one before starting the other. Separate IRC services are unchanged.
+
+Development checks: `npm run test:omp`, `npm run typecheck`, `npm run build`. Build again before restarting the installed service; it runs `dist/omp/main.js`, not TypeScript source.
+
+## Upstream Pi adapter
+
 ![pi-telegram screenshot](screenshot.png)
 
 **A Telegram companion hub for live Pi sessions.**

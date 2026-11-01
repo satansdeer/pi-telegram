@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "types": ["node"],
   },
-  "include": ["index.ts", "lib/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
+  "include": ["index.ts", "lib/**/*.ts", "omp/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
 }

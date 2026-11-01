@@ -1,11 +1,11 @@
 {
   "name": "@llblab/pi-telegram",
   "version": "0.58.3",
-  "private": false,
+  "private": true,
   "publishConfig": {
     "access": "public"
   },
-  "description": "Telegram runtime adapter for Pi",
+  "description": "OMP Workspace forum-topic supervisor and upstream Pi Telegram adapter",
   "keywords": [
     "pi-package",
     "pi",
@@ -17,16 +17,19 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/llblab/pi-telegram.git"
+    "url": "https://github.com/satansdeer/pi-telegram.git"
   },
-  "homepage": "https://github.com/llblab/pi-telegram",
+  "homepage": "https://github.com/satansdeer/pi-telegram",
   "bugs": {
-    "url": "https://github.com/llblab/pi-telegram/issues"
+    "url": "https://github.com/satansdeer/pi-telegram/issues"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
+    "omp": "node --experimental-strip-types omp/main.ts",
+    "omp:check": "node --experimental-strip-types omp/main.ts --check",
+    "test:omp": "node --experimental-strip-types --test tests/omp-*.test.ts",
     "test": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-concurrency=4 --test-reporter=dot tests/*.test.ts",
     "test:low-concurrency": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-concurrency=2 --test-reporter=dot tests/*.test.ts",
     "test:verbose": "node --experimental-strip-types --import ./tests/fixtures/canonical-tmpdir.ts --test --test-reporter=spec tests/*.test.ts",
@@ -44,6 +47,7 @@
     "index.ts",
     "api/",
     "lib/",
+    "omp/",
     "dist/",
     "README.md",
     "AGENTS.md",

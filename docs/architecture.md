@@ -1,5 +1,13 @@
 # Telegram Bridge Architecture
 
+## OMP Workspace fork boundary
+
+`omp/main.ts` is an explicitly launched composition root, separate from the Pi extension. It owns one bot poller and the daemon ownership lock. `omp/workspace.ts` owns owner-only admission, durable forum-topic/chat/transcript bindings, per-topic controls, and exact-target delivery. `omp/rpc.ts` owns one OMP child, its correlated JSONL protocol, transcript verification, and graceful shutdown. Only the pure Telegram target helper is shared with `lib/`; there is no dependency on Pi runtime state.
+
+Generated chat IDs, Telegram topic IDs, and OMP session IDs are distinct identities. Bindings retain the absolute transcript path across restarts; resumed identities must match before a prompt is accepted. Durable admissions advance the poll offset before side effects. Interrupted or ambiguous operations produce diagnostics instead of replay; failed delivery never repeats model execution. Different topics are independent; each topic admits one active prompt.
+
+This supervisor intentionally differs from the Pi companion boundary described below: it launches OMP sessions because Workspace topics are the operator's session-management surface. It is never started implicitly by the Pi extension. See [OMP setup and recovery](../README.md#omp-workspace-this-fork).
+
 ## Purpose
 
 `pi-telegram` is a session-aware Pi runtime extension that binds Telegram destinations to running Pi instances and routes each accepted prompt into the assigned instance's currently active session. It owns the Telegram bridge boundary:

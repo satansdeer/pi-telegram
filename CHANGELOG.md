@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `OMP Workspace`: Added an explicit standalone daemon with owner-only forum binding, generated chat IDs, one persistent OMP transcript per topic, concurrent topic routing, and topic-local status/abort/UI controls. Exact resume validation and durable admission prevent silent session replacement or crash replay; failed delivery does not rerun prompts. The upstream Pi adapter and separate IRC services remain unchanged.
+
 ## 0.58.3: Typing Cancellation Diagnostics
 
 - `Typing diagnostics`: Ended typing loops no longer log cancellation-only authority refusals as API failures. Real HTTP/network failures retain their provenance and diagnostics even if authority expires before settlement. Requests remain rejected and single-attempt; callbacks stay local. Native late-success/failure and follower-ACK regressions cover this case, not the cause of the live report.
