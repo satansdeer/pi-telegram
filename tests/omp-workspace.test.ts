@@ -21,6 +21,7 @@ class FakeSession implements SessionPort {
   readonly binding: Binding;
   readonly prompts: string[] = [];
   readonly btws: string[] = [];
+  readonly steers: string[] = [];
   readonly answers: Array<{ id: string; response: Record<string, unknown> }> = [];
   aborts = 0;
   stopped = false;
@@ -41,6 +42,7 @@ class FakeSession implements SessionPort {
     this.admitted(this.binding.threadId);
     return promise;
   }
+  async steer(body: string): Promise<void> { this.steers.push(body); }
   async btw(body: string): Promise<string> {
     this.btws.push(body);
     return `sidecar: ${body}`;
@@ -67,6 +69,7 @@ class FakeSession implements SessionPort {
 class TerminalSession implements SessionPort {
   readonly identity: { sessionId: string; sessionFile: string; cwd: string };
   readonly prompts: string[] = [];
+  readonly steers: string[] = [];
   readonly attached: Array<Binding & { groupId: number }> = [];
   streaming = false;
   aborts = 0;
@@ -90,6 +93,7 @@ class TerminalSession implements SessionPort {
     this.prompts.push(body);
     return `${this.identity.sessionId} response`;
   }
+  async steer(body: string): Promise<void> { this.steers.push(body); }
   async btw(body: string): Promise<string> { return `sidecar: ${body}`; }
   async abort(): Promise<void> { this.aborts++; }
   async answer(): Promise<void> { throw new Error("Use the terminal for interactive dialogs"); }
@@ -194,8 +198,9 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     await h.dispatch("alpha input", alpha);
     await h.dispatch("beta input", beta);
     await h.until(() => h.sessions.get(alpha)!.prompts.length === 1 && h.sessions.get(beta)!.prompts.length === 1);
-    await h.dispatch("must not queue", alpha);
-    await h.reply("This topic is busy", alpha);
+    await h.dispatch("change direction", alpha);
+    await h.reply("Steering applied", alpha);
+    assert.deepEqual(h.sessions.get(alpha)!.steers, ["change direction"]);
     await h.dispatch("/status", alpha);
     await h.reply("Busy", alpha);
     assert.deepEqual(h.sessions.get(alpha)!.prompts, ["alpha input"]);
@@ -505,6 +510,7 @@ test("Terminal bindings route to the live port and remain offline after disconne
   const port: SessionPort = {
     async state() { return identity; },
     async prompt(text) { prompts.push(text); return "same live terminal response"; },
+    async steer(text) { prompts.push(`steer:${text}`); },
     async btw(text) { return `sidecar: ${text}`; },
     async abort() { aborts++; },
     async answer() { throw new Error("Use the terminal for interactive dialogs"); },
@@ -571,6 +577,7 @@ test("Terminal attachment cannot take over a daemon-owned transcript", { timeout
     const port: SessionPort = {
       async state() { return { ...await owned.state(), cwd: "/workspace" }; },
       async prompt() { throw new Error("must not route"); },
+      async steer() { throw new Error("must not route"); },
       async btw() { throw new Error("must not route"); },
       async abort() {}, async answer() {}, async stop() {},
     };

@@ -36,7 +36,7 @@ export interface TerminalContext {
 
 export interface TerminalHost {
   registerCommand(name: string, options: { description?: string; handler(args: string, ctx: TerminalContext): Promise<void> }): void;
-  sendUserMessage(text: string): void;
+  sendUserMessage(text: string, options?: { deliverAs?: "steer" | "followUp" }): void;
   on<K extends keyof Events>(event: K, handler: (event: Events[K], ctx: TerminalContext) => void | { handled: true }): void;
 }
 
@@ -202,6 +202,13 @@ export default function telegramExtension(pi: TerminalHost, connect: typeof conn
         } finally {
           sidecar = false;
         }
+      }
+      if (method === "steer") {
+        parameters(params, ["text"]);
+        if (typeof params.text !== "string" || !params.text.trim()) throw new Error("Telegram steering text must not be empty.");
+        if (!pending && !activeOperation && ctx.isIdle()) throw new Error("OMP has no active turn to steer; send this again as a new prompt.");
+        pi.sendUserMessage(params.text, { deliverAs: "steer" });
+        return;
       }
       if (method !== "prompt") throw new Error(`Unsupported Telegram terminal method: ${method}`);
       parameters(params, ["text"]);

@@ -25,6 +25,7 @@ const send = frame => process.stdout.write(JSON.stringify(frame) + "\n");
 const reply = (frame, data = {}) => send({type: "response", id: frame.id, command: frame.type, success: true, data});
 let active;
 let btw;
+let steering = [];
 function finish(text, status = "completed") {
   const current = active;
   active = undefined;
@@ -65,9 +66,12 @@ input.on("line", line => {
       : {...btw, status: "complete", answer: "side:" + frame.question, updatedAt: Date.now()};
     send({type: "btw_record", record: btw});
     btw = undefined;
+  } else if (frame.type === "steer") {
+    steering.push(frame.message);
+    reply(frame, {disposition: "queued"});
   } else if (frame.type === "extension_ui_response" && active) {
     if (frame.cancelled) finish(null, "aborted");
-    else finish("final:" + active.message);
+    else finish("final:" + active.message + (steering.length ? "|steer:" + steering.join(",") : ""));
   } else if (frame.type === "abort") {
     reply(frame);
     if (active) finish(null, "aborted");
@@ -107,9 +111,11 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     assert.equal(settled, false, "an ephemeral side question must not settle the main turn");
     await assert.rejects(session.btw("fail-sidecar"), /sidecar provider failed/);
     assert.equal(session.busy, true);
+    await session.steer("change direction");
     await session.answer(request.id, { value: "finish" });
-    assert.equal(await first, "final:first");
+    assert.equal(await first, "final:first|steer:change direction");
     assert.equal(session.busy, false);
+    await assert.rejects(session.steer("too late"), /no active prompt/);
     assert.equal(await session.prompt("empty"), "", "an empty turn must not return the previous reply");
     await assert.rejects(session.prompt("fail"), /provider rejected the turn/);
     assert.equal(session.busy, false);

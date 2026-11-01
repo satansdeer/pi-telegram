@@ -21,7 +21,7 @@ const HELP = [
     "/answer <request-id> <JSON object> — answer this topic's pending UI request",
     "/cancel <request-id> — cancel this topic's pending UI request",
     "/help — show these commands",
-    "Only the configured owner can send input. Send plain text inside a bound topic; attachments and other slash commands are not forwarded.",
+    "Only the configured owner can send input. Plain text in an idle topic starts a turn; additional plain text steers its active turn. Attachments and other slash commands are not forwarded.",
 ].join("\n");
 const DIALOGS = { confirm: true, select: true, input: true, editor: true, ask: true };
 const ATTACHMENTS = ["photo", "animation", "audio", "document", "video", "video_note", "voice", "sticker", "contact", "location", "venue", "poll", "dice", "paid_media"];
@@ -178,7 +178,8 @@ export class WorkspaceBridge {
     sessions = new Map();
     terminals = new Map();
     pending = new Map();
-    busy = new Set();
+    busy = new Map();
+    starts = new Map();
     groupSetup = false;
     constructor(options, api, openSession) {
         if (!integer(options.ownerId) || !integer(options.botId) || !/^[A-Za-z0-9_]+$/.test(options.botUsername))
@@ -409,21 +410,34 @@ export class WorkspaceBridge {
         let refusal = owner ? undefined : "Owner only: this bot does not accept input or controls from other group members.";
         let reserved = false;
         let setup = false;
+        let steeringReady;
+        let turnStarted;
         if (owner && !command && input.trim() && target.chatId === this.data.groupId && target.threadId !== undefined
             && this.data.bindings.some((binding) => binding.threadId === target.threadId)) {
-            if (this.busy.has(target.threadId))
-                refusal = "This topic is busy. Use /status or /abort; input was not queued.";
-            else {
-                this.busy.add(target.threadId);
-                reserved = true;
+            const count = this.busy.get(target.threadId);
+            if (count !== undefined) {
+                steeringReady = this.starts.get(target.threadId);
+                if (steeringReady) {
+                    this.busy.set(target.threadId, count + 1);
+                    reserved = true;
+                }
+                else
+                    refusal = "This topic is busy; its binding is still being initialized.";
             }
+            else {
+                const started = Promise.withResolvers();
+                this.busy.set(target.threadId, 1);
+                this.starts.set(target.threadId, started.promise);
+                turnStarted = started.resolve;
+            }
+            reserved = true;
         }
         if (owner && command?.name === "bind" && target.chatId === this.data.groupId && target.threadId !== undefined && target.threadId > 1
             && !this.data.bindings.some((binding) => binding.threadId === target.threadId)) {
             if (this.busy.has(target.threadId))
                 refusal = "This topic is busy; its binding is already being initialized.";
             else {
-                this.busy.add(target.threadId);
+                this.busy.set(target.threadId, 1);
                 reserved = true;
             }
         }
@@ -435,17 +449,29 @@ export class WorkspaceBridge {
                 setup = true;
             }
         }
-        const admission = { updateId: update.update_id, target, kind: refusal ? "refusal" : command?.name ?? (input ? "prompt" : "attachment"), phase: "admitted" };
+        const admission = {
+            updateId: update.update_id, target,
+            kind: refusal ? "refusal" : command?.name ?? (steeringReady ? "steer" : input ? "prompt" : "attachment"),
+            phase: "admitted",
+        };
         this.data.admissions.push(admission);
         await this.save();
-        this.track(this.process(admission, message, command, refusal).finally(() => {
-            if (reserved && target.threadId !== undefined)
-                this.busy.delete(target.threadId);
+        this.track(this.process(admission, message, command, refusal, steeringReady, turnStarted).finally(() => {
+            turnStarted?.();
+            if (reserved && target.threadId !== undefined) {
+                const count = this.busy.get(target.threadId) ?? 0;
+                if (count <= 1) {
+                    this.busy.delete(target.threadId);
+                    this.starts.delete(target.threadId);
+                }
+                else
+                    this.busy.set(target.threadId, count - 1);
+            }
             if (setup)
                 this.groupSetup = false;
         }));
     }
-    async process(admission, message, command, refusal) {
+    async process(admission, message, command, refusal, steeringReady, turnStarted) {
         try {
             if (refusal)
                 await this.reply(admission, refusal);
@@ -455,6 +481,19 @@ export class WorkspaceBridge {
                 await this.reply(admission, "Attachments are unsupported. Send a plain-text message inside a bound topic.");
             else if (!message.text.trim())
                 await this.reply(admission, "Send a non-empty plain-text message.");
+            else if (admission.kind === "steer") {
+                await steeringReady;
+                this.requireGroup(admission.target);
+                const binding = this.requireBinding(admission.target);
+                const session = await this.session(binding);
+                await this.assertIdentity(binding, session);
+                admission.phase = "running";
+                await this.save();
+                if (binding.external)
+                    this.externalRegistration(binding, session);
+                await session.steer(message.text);
+                await this.reply(admission, "↪️ Steering applied to the active turn.");
+            }
             else {
                 this.requireGroup(admission.target);
                 const binding = this.requireBinding(admission.target);
@@ -467,7 +506,9 @@ export class WorkspaceBridge {
                 const stopTyping = this.startTyping(admission.target);
                 let output;
                 try {
-                    output = await session.prompt(message.text);
+                    const prompt = session.prompt(message.text);
+                    turnStarted?.();
+                    output = await prompt;
                 }
                 finally {
                     stopTyping();
@@ -604,7 +645,7 @@ export class WorkspaceBridge {
             }
             const binding = { id, threadId: threadId, name, cwd };
             this.data.bindings.push(binding);
-            this.busy.add(binding.threadId);
+            this.busy.set(binding.threadId, 1);
             await this.save();
             try {
                 await this.session(binding, true);

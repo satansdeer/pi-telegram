@@ -209,6 +209,15 @@ export class OmpSession {
     return await completion.promise;
   }
 
+  async steer(text: string): Promise<void> {
+    if (this.failure) throw this.failure;
+    if (this.stopping) throw new Error("OMP session is stopping");
+    if (!this.turn) throw new Error("OMP has no active prompt to steer; send this again as a new prompt");
+    const response = await this.request("steer", { message: text });
+    const disposition = record(response.data) ? response.data.disposition : undefined;
+    if (disposition !== "handled" && disposition !== "queued") throw new Error("OMP returned an invalid steering response");
+  }
+
   async btw(question: string): Promise<string> {
     if (this.sidecar) throw new Error("An OMP /btw question is already running");
     if (this.failure) throw this.failure;

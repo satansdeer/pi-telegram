@@ -29,6 +29,7 @@ export declare class OmpSession {
     ready(): Promise<Record<string, unknown>>;
     state(): Promise<Record<string, unknown>>;
     prompt(text: string): Promise<string>;
+    steer(text: string): Promise<void>;
     btw(question: string): Promise<string>;
     abort(): Promise<void>;
     answer(id: string, response: Record<string, unknown>): Promise<void>;

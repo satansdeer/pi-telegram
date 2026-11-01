@@ -56,7 +56,9 @@ export interface TerminalHost {
         description?: string;
         handler(args: string, ctx: TerminalContext): Promise<void>;
     }): void;
-    sendUserMessage(text: string): void;
+    sendUserMessage(text: string, options?: {
+        deliverAs?: "steer" | "followUp";
+    }): void;
     on<K extends keyof Events>(event: K, handler: (event: Events[K], ctx: TerminalContext) => void | {
         handled: true;
     }): void;

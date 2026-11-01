@@ -19,6 +19,7 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
   const notifications: { message: string; type?: string }[] = [];
   const sent: string[] = [];
   const sidecarPrompts: string[] = [];
+  const steered: string[] = [];
   const links: Link[] = [];
   const deferred = Promise.withResolvers<void>();
   const identity = { sessionId: "terminal-session", sessionFile: "/sessions/terminal.jsonl", cwd: "/project" };
@@ -43,7 +44,11 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
   };
   const host: TerminalHost = {
     registerCommand(name, command) { commands.set(name, command.handler); },
-    sendUserMessage(text) { if (sendFailure) throw sendFailure; sent.push(text); },
+    sendUserMessage(text, options) {
+      if (sendFailure) throw sendFailure;
+      if (options?.deliverAs === "steer") steered.push(text);
+      else sent.push(text);
+    },
     on(event, callback) { listeners.set(event, callback as (event: unknown, ctx: TerminalContext) => unknown); },
   };
   telegramExtension(host, async (handler, onClose) => {
@@ -75,7 +80,7 @@ function harness(options: { deferredConnect?: boolean; subagent?: boolean; unava
     return listeners.get(event)?.({ type: event, ...data }, ctx);
   }
   return {
-    identity, notifications, sent, sidecarPrompts, links, ctx,
+    identity, notifications, sent, steered, sidecarPrompts, links, ctx,
     get aborts() { return aborts; },
     get attempts() { return attempts; },
     setUnavailable(value: boolean) { unavailable = value; },
@@ -117,6 +122,8 @@ test("terminal attachment is idempotent, reserves admission before dispatch, and
   assert.deepEqual(terminal.sent, ["remote task"]);
   assert.equal((await terminal.remote("state") as { isStreaming: boolean }).isStreaming, true);
   await assert.rejects(terminal.remote("prompt", { text: "another remote task" }), /busy/);
+  await terminal.remote("steer", { text: "change direction" });
+  assert.deepEqual(terminal.steered, ["change direction"]);
   assert.equal(await terminal.remote("btw", { text: "what is happening?" }), "sidecar answer");
   assert.match(terminal.sidecarPrompts[0]!, /^<btw>\nEphemeral side question/);
   assert.match(terminal.sidecarPrompts[0]!, /Question:\nwhat is happening\?\n<\/btw>$/);

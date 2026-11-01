@@ -111,6 +111,7 @@ if (process.argv.includes("--check")) {
           if (typeof result !== "string") throw new Error("Attached OMP terminal returned an invalid /btw response");
           return result;
         },
+        async steer(text) { await peer.request("steer", { text }); },
         async prompt(text) {
           const response = await peer.request("prompt", { text });
           if (typeof response !== "string") throw new Error("Invalid terminal response");

@@ -15,6 +15,7 @@ export interface UiRequest {
 }
 export interface SessionPort {
     prompt(text: string): Promise<string>;
+    steer(text: string): Promise<void>;
     btw(text: string): Promise<string>;
     abort(): Promise<void>;
     state(): Promise<Record<string, unknown>>;
@@ -54,6 +55,7 @@ export declare class WorkspaceBridge {
     private readonly terminals;
     private readonly pending;
     private readonly busy;
+    private readonly starts;
     private groupSetup;
     constructor(options: Options, api: Api, openSession: OpenSession);
     get offset(): number;

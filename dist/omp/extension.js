@@ -165,6 +165,15 @@ export default function telegramExtension(pi, connect = connectWorkspace) {
                     sidecar = false;
                 }
             }
+            if (method === "steer") {
+                parameters(params, ["text"]);
+                if (typeof params.text !== "string" || !params.text.trim())
+                    throw new Error("Telegram steering text must not be empty.");
+                if (!pending && !activeOperation && ctx.isIdle())
+                    throw new Error("OMP has no active turn to steer; send this again as a new prompt.");
+                pi.sendUserMessage(params.text, { deliverAs: "steer" });
+                return;
+            }
             if (method !== "prompt")
                 throw new Error(`Unsupported Telegram terminal method: ${method}`);
             parameters(params, ["text"]);
