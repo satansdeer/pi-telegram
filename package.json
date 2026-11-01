@@ -104,6 +104,11 @@
       "default": "./dist/api/keyboard.js"
     }
   },
+  "omp": {
+    "extensions": [
+      "./dist/omp/extension.js"
+    ]
+  },
   "pi": {
     "extensions": [
       "./dist/pi-telegram/index.js"

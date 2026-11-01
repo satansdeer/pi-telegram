@@ -4,7 +4,17 @@
 
 This fork additionally provides an explicit standalone OMP supervisor under
 `omp/`, launched by the operator, not loaded as a Pi extension. It owns one
-Telegram bot poller and one persistent OMP RPC session per group forum topic.
+Telegram bot poller and one designated OMP session per group forum topic.
+`/new` and `/bind` create daemon-owned RPC children, marked
+`OMP_WORKSPACE_MANAGED=1` to exclude them from external discovery. Native main
+terminals register ephemeral presence automatically. Owner-only `/running` lists
+fresh identities; `/attach <full-session-id>` or native `/telegram-connect`
+attaches that exact live process through authenticated local IPC without spawning
+or resuming another process. Discovery retries must never replay attachments or
+prompts. Terminal-owned bindings fail offline after disconnect; explicit attach
+reuses the durable topic. Preserve identity fencing, busy-turn admission, and
+non-aborting detach. `/telegram-disconnect` opts out of discovery until manual
+connect or a new session lifecycle. Attached-session dialogs stay local.
 The Pi extension contracts below remain unchanged and apply to `lib/` and
 `api/`. Never run both entrypoints (or another poller) with the same bot token.
 Workspace routing requires the configured human owner and the exact persisted

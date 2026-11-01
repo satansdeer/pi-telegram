@@ -3,9 +3,10 @@
  * Zones: forum/session isolation, owner admission, crash recovery, durable identity.
  */
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scheduler } from "node:timers/promises";
 import { test } from "node:test";
 import { WorkspaceBridge } from "../omp/workspace.ts";
 import type { Binding, SessionPort, UiRequest } from "../omp/workspace.ts";
@@ -14,6 +15,7 @@ const OWNER = 42;
 const BOT = 99;
 const GROUP = -100123;
 type Sent = { chat_id: number; message_thread_id?: number; text: string };
+type Action = { chat_id: number; message_thread_id?: number; action: "typing" };
 
 class FakeSession implements SessionPort {
   readonly binding: Binding;
@@ -57,9 +59,41 @@ class FakeSession implements SessionPort {
   }
 }
 
+class TerminalSession implements SessionPort {
+  readonly identity: { sessionId: string; sessionFile: string; cwd: string };
+  readonly prompts: string[] = [];
+  readonly attached: Array<Binding & { groupId: number }> = [];
+  streaming = false;
+  aborts = 0;
+  stopped = false;
+  beforeState?: () => Promise<void>;
+  beforeAttach?: () => Promise<void>;
+  constructor(sessionId: string, cwd = "/terminal/project", sessionFile = `/terminal/${sessionId}.jsonl`) {
+    this.identity = { sessionId, cwd, sessionFile };
+  }
+  async state(): Promise<Record<string, unknown>> {
+    const hook = this.beforeState;
+    this.beforeState = undefined;
+    await hook?.();
+    return { ...this.identity, isStreaming: this.streaming };
+  }
+  readonly onAttach = async (binding: Binding & { groupId: number }): Promise<void> => {
+    this.attached.push(binding);
+    await this.beforeAttach?.();
+  };
+  async prompt(body: string): Promise<string> {
+    this.prompts.push(body);
+    return `${this.identity.sessionId} response`;
+  }
+  async abort(): Promise<void> { this.aborts++; }
+  async answer(): Promise<void> { throw new Error("Use the terminal for interactive dialogs"); }
+  async stop(): Promise<void> { this.stopped = true; }
+}
+
 class Harness {
   readonly bridge: WorkspaceBridge;
   readonly sent: Sent[] = [];
+  readonly actions: Action[] = [];
   readonly opened: Binding[] = [];
   readonly sessions = new Map<number, FakeSession>();
   readonly ui = new Map<number, (request: UiRequest) => void>();
@@ -68,12 +102,22 @@ class Harness {
   private updateId: number;
   private nextThread = 100;
   failSend?: (message: Sent) => boolean;
-  constructor(statePath: string, offset = 0) {
+  beforeCreateTopic?: () => Promise<void>;
+  constructor(statePath: string, offset = 0, cwd = "/workspace") {
     this.updateId = offset;
-    this.bridge = new WorkspaceBridge({ statePath, cwd: "/workspace", ownerId: OWNER, botId: BOT, botUsername: "workspace_bot" }, async (method, params) => {
+    this.bridge = new WorkspaceBridge({ statePath, cwd, ownerId: OWNER, botId: BOT, botUsername: "workspace_bot" }, async (method, params) => {
       if (method === "getChat") return { id: params.chat_id, type: "supergroup", is_forum: true };
       if (method === "getChatMember") return { user: { id: BOT }, status: "administrator", can_manage_topics: true };
-      if (method === "createForumTopic") { this.created.push(params); return { message_thread_id: ++this.nextThread, name: params.name }; }
+      if (method === "createForumTopic") {
+        this.created.push(params);
+        await this.beforeCreateTopic?.();
+        return { message_thread_id: ++this.nextThread, name: params.name };
+      }
+      if (method === "sendChatAction") {
+        this.actions.push({ ...(params as Action) });
+        for (const listener of this.listeners) listener();
+        return true;
+      }
       assert.equal(method, "sendMessage");
       const sent = params as Sent;
       if (this.failSend?.(sent)) throw new Error("test transport unavailable");
@@ -93,6 +137,11 @@ class Harness {
   }
   async dispatch(body: string, threadId?: number, ownerId = OWNER, groupId = GROUP): Promise<void> {
     await this.bridge.handle(this.update(body, threadId, ownerId, groupId));
+  }
+  async command(body: string, contains: string, threadId?: number, ownerId = OWNER, groupId = GROUP): Promise<Sent> {
+    const after = this.sent.length;
+    await this.dispatch(body, threadId, ownerId, groupId);
+    return this.reply(contains, threadId, after);
   }
   async until(predicate: () => boolean): Promise<void> {
     if (predicate()) return;
@@ -187,6 +236,32 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     resumed.sessions.get(alpha)!.complete("resumed alpha");
     await resumed.reply("resumed alpha", alpha);
     await resumed.bridge.stop();
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace refreshes exact-topic typing only while the model is working", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-typing-"));
+  const h = new Harness(join(directory, "state.json"));
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create("Typing");
+    await h.dispatch("long prompt", threadId);
+    await h.until(() => h.actions.length === 1);
+    assert.deepEqual(h.actions[0], { chat_id: GROUP, message_thread_id: threadId, action: "typing" });
+
+    t.mock.timers.tick(3000);
+    await scheduler.yield();
+    assert.equal(h.actions.length, 2, "typing is refreshed before Telegram expires it");
+
+    h.sessions.get(threadId)!.complete("finished");
+    await h.reply("finished", threadId);
+    t.mock.timers.tick(3000);
+    await scheduler.yield();
+    assert.equal(h.actions.length, 2, "typing stops when model work completes");
   } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
@@ -339,6 +414,388 @@ test("Workspace shutdown retains an explicit failure when a designated child may
       && error.errors.some((cause) => cause instanceof Error && cause.message === "child still draining"));
   } finally {
     for (const session of h.sessions.values()) session.stop = FakeSession.prototype.stop.bind(session);
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace validates project directories before creating topics and persists canonical per-chat directories", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-cwd-"));
+  const statePath = join(directory, "state.json");
+  const project = join(directory, "project with spaces");
+  await mkdir(project);
+  await symlink(project, join(directory, "alias"));
+  const canonical = await realpath(project);
+  const h = new Harness(statePath, 0, directory);
+  try {
+    await h.bindWorkspace();
+    const relative = await h.create("--cwd project with spaces");
+    const absolute = await h.create(`Named work --cwd ${join(directory, "alias")}`);
+    const created = h.created.length;
+    const opened = h.opened.length;
+    for (const argument of ["--cwd", "--cwd missing-project", "--cwd state.json"]) {
+      const replies = h.sent.length;
+      await h.dispatch(`/new ${argument}`);
+      await h.until(() => h.sent.length > replies);
+      assert.equal(h.created.length, created, "invalid directories must not leave orphan Telegram topics");
+      assert.equal(h.opened.length, opened, "invalid directories must not start OMP");
+    }
+    await h.bridge.stop();
+    const stored = JSON.parse(await readFile(statePath, "utf8"));
+    assert.deepEqual(stored.bindings.map((binding: Binding) => ({
+      threadId: binding.threadId, cwd: binding.cwd, name: binding.name,
+    })), [
+      { threadId: relative, cwd: canonical, name: "project with spaces" },
+      { threadId: absolute, cwd: canonical, name: "Named work" },
+    ]);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Terminal bindings route to the live port and remain offline after disconnect or daemon restart", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-terminal-"));
+  const statePath = join(directory, "state.json");
+  const h = new Harness(statePath);
+  let restarted: Harness | undefined;
+  const identity = { sessionId: "terminal-session", sessionFile: "/terminal/session.jsonl", cwd: "/terminal/project" };
+  const prompts: string[] = [];
+  let aborts = 0;
+  const port: SessionPort = {
+    async state() { return identity; },
+    async prompt(text) { prompts.push(text); return "same live terminal response"; },
+    async abort() { aborts++; },
+    async answer() { throw new Error("Use the terminal for interactive dialogs"); },
+    async stop() {},
+  };
+  try {
+    await h.bindWorkspace();
+    await h.bridge.register(port, async () => {});
+    const attached = await h.bridge.attach(port, "Terminal project");
+    assert.equal(attached.external, true);
+    assert.equal(attached.sessionId, identity.sessionId);
+    assert.equal((await h.bridge.attach(port, "Duplicate")).id, attached.id);
+    assert.equal(h.created.length, 1, "duplicate live attachments must not create orphan topics");
+    await h.dispatch("continue terminal work", attached.threadId);
+    await h.reply("same live terminal response", attached.threadId);
+    assert.deepEqual(prompts, ["continue terminal work"]);
+    assert.equal(h.opened.length, 0, "attaching must never spawn a shadow OMP");
+    await h.dispatch("/abort", attached.threadId);
+    await h.reply("Abort requested", attached.threadId);
+    assert.equal(aborts, 1);
+    await h.bridge.detach(port);
+    await h.dispatch("offline input", attached.threadId);
+    await h.reply("Designated terminal is offline", attached.threadId);
+    assert.deepEqual(prompts, ["continue terminal work"]);
+    const offlineStatus = h.sent.length;
+    await h.dispatch("/status", attached.threadId);
+    await h.reply("Terminal: offline", attached.threadId, offlineStatus);
+    await h.bridge.register(port, async () => {});
+    const reconnected = await h.bridge.attach(port, "Ignored new name");
+    assert.equal(reconnected.threadId, attached.threadId);
+    assert.equal(h.created.length, 1, "reconnect must preserve the generated chat and topic");
+    await h.bridge.detach(port);
+    await h.bridge.stop();
+    const stored = JSON.parse(await readFile(statePath, "utf8"));
+    restarted = new Harness(statePath, stored.offset);
+    await restarted.bridge.init();
+    await restarted.dispatch("must not resume terminal transcript", attached.threadId);
+    await restarted.reply("Designated terminal is offline", attached.threadId);
+    assert.equal(restarted.opened.length, 0, "external ownership survives daemon restart");
+    const restartedStatus = restarted.sent.length;
+    await restarted.dispatch("/status", attached.threadId);
+    await restarted.reply("Terminal: offline", attached.threadId, restartedStatus);
+    await restarted.command("/running", "No live terminals registered");
+    await assert.rejects(restarted.bridge.attach(port, "Not registered"), /not registered/);
+    await restarted.bridge.register(port, async () => {});
+    await restarted.command("/running", "Telegram topic: not attached");
+    const restored = await restarted.bridge.attach(port, "Reconnect after restart");
+    assert.equal(restored.id, attached.id);
+    assert.equal(restarted.created.length, 0);
+  } finally {
+    await h.bridge.stop();
+    await restarted?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Terminal attachment cannot take over a daemon-owned transcript", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-ownership-"));
+  const h = new Harness(join(directory, "state.json"));
+  try {
+    await h.bindWorkspace();
+    const thread = await h.create();
+    const owned = h.sessions.get(thread)!;
+    const port: SessionPort = {
+      async state() { return { ...await owned.state(), cwd: "/workspace" }; },
+      async prompt() { throw new Error("must not route"); },
+      async abort() {}, async answer() {}, async stop() {},
+    };
+    await assert.rejects(h.bridge.register(port, async () => {}), /different session owner/);
+    await assert.rejects(h.bridge.attach(port, "Takeover"), /not registered/);
+    const ownedIdentity = await port.state();
+    for (const override of [{ sessionId: "different-id" }, { sessionFile: "/other/transcript.jsonl" }]) {
+      const conflict: SessionPort = { ...port, async state() { return { ...ownedIdentity, ...override }; } };
+      await assert.rejects(h.bridge.register(conflict, async () => {}), /different session owner/);
+    }
+    assert.equal(h.created.length, 1);
+    await h.dispatch("owned input", thread);
+    await h.until(() => owned.prompts.length === 1);
+    owned.complete("owned response");
+    await h.reply("owned response", thread);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Telegram discovers live terminals without topics and attaches only the exact chosen session", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-discovery-"));
+  const statePath = join(directory, "state.json");
+  const h = new Harness(statePath);
+  const alpha = new TerminalSession("shared-prefix-alpha-full-id", "/projects/alpha");
+  const beta = new TerminalSession("shared-prefix-beta-full-id", "/projects/beta");
+  beta.streaming = true;
+  try {
+    await h.bridge.init();
+    const before = await readFile(statePath, "utf8");
+    await h.bridge.register(alpha, alpha.onAttach);
+    await h.bridge.register(beta, beta.onAttach);
+    assert.equal(await readFile(statePath, "utf8"), before, "discovery is not durable topic/session state");
+    assert.equal(h.created.length, 0);
+    assert.equal(h.sent.length, 0);
+    await assert.rejects(h.bridge.attach(alpha, "Before setup"), /Send \/workspace/);
+    await h.command("/running", "Workspace is unbound");
+    await h.command(`/attach ${beta.identity.sessionId}`, "Workspace is unbound");
+    await h.command("/workspace", "Workspace bound");
+
+    const listing = await h.command("/running", alpha.identity.sessionId);
+    assert.ok(listing.text.includes(`OMP session: ${alpha.identity.sessionId}\nCwd: /projects/alpha\nIdle`));
+    assert.ok(listing.text.includes(`OMP session: ${beta.identity.sessionId}\nCwd: /projects/beta\nBusy`));
+    assert.equal(h.created.length, 0, "listing must not create even an unattached terminal's topic");
+    assert.equal(h.opened.length, 0);
+    assert.equal(alpha.attached.length + beta.attached.length, 0);
+    await h.command("/running extra", "Usage: /running");
+    await h.command("/attach", "Usage: /attach <full-session-id>");
+    await h.command(`/attach ${beta.identity.sessionId} extra`, "Usage: /attach <full-session-id>");
+    await h.command("/attach shared-prefix", "No live terminal with that exact full session ID");
+    for (const body of ["/running", `/attach ${beta.identity.sessionId}`]) {
+      await h.command(body, "Owner only", undefined, OWNER + 1);
+      await h.command(body, "only in the bound Workspace group", undefined, OWNER, GROUP - 1);
+    }
+    assert.equal(h.created.length, 0);
+
+    const attached = await h.command(`/attach ${beta.identity.sessionId}`, "Terminal attached.");
+    assert.ok(attached.text.includes("https://t.me/c/123/101"));
+    assert.equal(beta.attached.length, 1);
+    assert.equal(beta.attached[0]!.groupId, GROUP);
+    assert.equal(beta.attached[0]!.sessionId, beta.identity.sessionId);
+    assert.equal(alpha.attached.length, 0);
+    assert.equal(h.created.length, 1);
+    await h.command("chosen live input", `${beta.identity.sessionId} response`, 101);
+    assert.deepEqual(beta.prompts, ["chosen live input"]);
+    assert.deepEqual(alpha.prompts, []);
+    await h.command("/abort", "Abort requested", 101);
+    assert.equal(beta.aborts, 1);
+    assert.equal(alpha.aborts, 0);
+    beta.streaming = false;
+    const fresh = await h.command("/running", `${beta.identity.sessionId}\nCwd: /projects/beta\nIdle`);
+    assert.ok(fresh.text.includes("Telegram topic: 101"));
+    h.bridge.detach(beta);
+    const closed = await h.command("/running", alpha.identity.sessionId);
+    assert.ok(!closed.text.includes(beta.identity.sessionId));
+    await h.command(`/attach ${beta.identity.sessionId}`, "No live terminal with that exact full session ID");
+    await h.command("offline input", "Designated terminal is offline", 101);
+    assert.deepEqual(beta.prompts, ["chosen live input"]);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Repeated and concurrent Telegram/local attachments create one topic without blocking discovery", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-attach-queue-"));
+  const h = new Harness(join(directory, "state.json"));
+  const terminal = new TerminalSession("concurrent-full-session-id");
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const requests: Array<Promise<unknown>> = [];
+  try {
+    await h.bindWorkspace();
+    await h.bridge.register(terminal, terminal.onAttach);
+    h.beforeCreateTopic = async () => { started.resolve(); await release.promise; };
+    const first = h.bridge.attach(terminal, "Chosen terminal");
+    const second = h.bridge.attach(terminal, "Do not rename");
+    requests.push(first, second);
+    await started.promise;
+    const after = h.sent.length;
+    await h.dispatch(`/attach ${terminal.identity.sessionId}`);
+    await h.dispatch(`/attach ${terminal.identity.sessionId}`);
+    await h.command("/running", "Telegram topic: not attached");
+    assert.equal(h.created.length, 1);
+    release.resolve();
+    const [binding, repeated] = await Promise.all([first, second]);
+    assert.equal(repeated.id, binding.id);
+    await h.reply("Terminal attached.", undefined, after);
+    await h.command(`/attach ${terminal.identity.sessionId}`, "Terminal attached.");
+    assert.equal((await h.bridge.attach(terminal, "Still the same")).threadId, binding.threadId);
+    assert.equal(h.created.length, 1);
+    assert.equal(terminal.attached.length, 1, "idempotent attachment does not authorize or notify twice");
+    assert.equal(h.opened.length, 0);
+    await h.command("routed after authorization", `${terminal.identity.sessionId} response`, binding.threadId);
+  } finally {
+    release.resolve();
+    await Promise.allSettled(requests);
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Registration fences exact identity and rejects duplicate session IDs or canonical transcript owners", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-identity-"));
+  const h = new Harness(join(directory, "state.json"));
+  const file = join(directory, "terminal.jsonl");
+  const alias = join(directory, "alias.jsonl");
+  await writeFile(file, "");
+  await symlink(file, alias);
+  const terminal = new TerminalSession("identity-full-id", "/project", file);
+  try {
+    await h.bindWorkspace();
+    for (const invalid of [
+      { sessionId: "", sessionFile: file, cwd: "/project" },
+      { sessionId: "has whitespace", sessionFile: file, cwd: "/project" },
+      { sessionId: "relative-file", sessionFile: "relative.jsonl", cwd: "/project" },
+      { sessionId: "relative-cwd", sessionFile: file, cwd: "relative" },
+    ]) {
+      const port = new TerminalSession("invalid");
+      Object.assign(port.identity, invalid);
+      await assert.rejects(h.bridge.register(port, port.onAttach), /persistent session identity/);
+      await assert.rejects(h.bridge.attach(port, "Invalid"), /not registered/);
+    }
+    const contenders = [new TerminalSession("concurrent-owner", "/one"), new TerminalSession("concurrent-owner", "/two", "/other/concurrent.jsonl")];
+    const registrations = await Promise.allSettled(contenders.map((port) => h.bridge.register(port, port.onAttach)));
+    assert.equal(registrations.filter((result) => result.status === "fulfilled").length, 1, "concurrent registration must reserve one live owner");
+    assert.equal(registrations.filter((result) => result.status === "rejected").length, 1);
+    for (const contender of contenders) h.bridge.detach(contender);
+    await h.bridge.register(terminal, terminal.onAttach);
+    const duplicateId = new TerminalSession(terminal.identity.sessionId, "/other", join(directory, "other.jsonl"));
+    const duplicateFile = new TerminalSession("other-full-id", "/other", alias);
+    await assert.rejects(h.bridge.register(duplicateId, duplicateId.onAttach), /live terminal owner/);
+    await assert.rejects(h.bridge.register(duplicateFile, duplicateFile.onAttach), /live terminal owner/);
+    terminal.identity.sessionId = "changed-full-id";
+    await h.command("/running", "No live terminals registered");
+    terminal.identity.sessionId = "identity-full-id";
+    await assert.rejects(h.bridge.attach(terminal, "Stale"), /not registered/);
+    await h.bridge.register(terminal, terminal.onAttach);
+    terminal.identity.cwd = "/changed-project";
+    await assert.rejects(h.bridge.attach(terminal, "Changed cwd"), /identity changed/);
+    terminal.identity.cwd = "/project";
+    await h.bridge.register(terminal, terminal.onAttach);
+    terminal.identity.sessionFile = alias;
+    await assert.rejects(h.bridge.attach(terminal, "Changed exact file"), /identity changed/);
+    terminal.identity.sessionFile = file;
+    assert.equal(h.created.length, 0, "stale identity cannot create a topic");
+    await h.bridge.register(terminal, terminal.onAttach);
+    const binding = await h.bridge.attach(terminal, "Identity owner");
+    terminal.identity.sessionId = "another-session";
+    await h.command("must not cross sessions", "identity changed", binding.threadId);
+    assert.deepEqual(terminal.prompts, []);
+    await assert.rejects(h.bridge.attach(terminal, "Stale route"), /not registered/);
+    await assert.rejects(h.bridge.register(duplicateFile, duplicateFile.onAttach), /different session owner/);
+    assert.equal(h.created.length, 1);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Disconnect during registration or attachment cannot resurrect discovery or topic routing", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-attach-close-"));
+  const h = new Harness(join(directory, "state.json"));
+  const gates: Array<{ resolve(): void }> = [];
+  const requests: Array<Promise<unknown>> = [];
+  try {
+    await h.bindWorkspace();
+    for (const phase of ["registration", "state", "topic", "persistence", "authorization"] as const) {
+      const terminal = new TerminalSession(`disconnect-${phase}-full-id`);
+      const started = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      gates.push(release);
+      const pause = async () => { started.resolve(); await release.promise; };
+      let pending: Promise<unknown>;
+      if (phase === "registration") {
+        terminal.beforeState = pause;
+        pending = h.bridge.register(terminal, terminal.onAttach);
+      } else {
+        await h.bridge.register(terminal, terminal.onAttach);
+        if (phase === "state") terminal.beforeState = pause;
+        if (phase === "topic") h.beforeCreateTopic = pause;
+        if (phase === "persistence") {
+          // Hold the persistence boundary without relying on filesystem scheduling.
+          const save = Reflect.get(h.bridge, "save");
+          Reflect.set(h.bridge, "save", async () => {
+            Reflect.set(h.bridge, "save", save);
+            const saved = Reflect.apply(save, h.bridge, []);
+            await pause();
+            await saved;
+          });
+        }
+        if (phase === "authorization") terminal.beforeAttach = pause;
+        pending = h.bridge.attach(terminal, phase);
+      }
+      requests.push(pending);
+      const rejected = assert.rejects(pending, /registration is no longer live/);
+      await started.promise;
+      const threadId = phase === "authorization" ? terminal.attached[0]!.threadId : undefined;
+      if (threadId !== undefined) {
+        await h.command("not authorized yet", "Designated terminal is offline", threadId);
+      }
+      h.bridge.detach(terminal);
+      release.resolve();
+      await rejected;
+      h.beforeCreateTopic = undefined;
+      await h.command("/running", "No live terminals registered");
+      await assert.rejects(h.bridge.attach(terminal, "Do not resurrect"), /not registered/);
+      assert.deepEqual(terminal.prompts, []);
+      if (phase === "topic" || phase === "persistence" || phase === "authorization") {
+        const created = h.created.length;
+        terminal.beforeAttach = undefined;
+        await h.bridge.register(terminal, terminal.onAttach);
+        const restored = await h.bridge.attach(terminal, "Reuse known created topic");
+        assert.equal(h.created.length, created);
+        h.bridge.detach(terminal);
+        await h.command("still offline", "Designated terminal is offline", restored.threadId);
+        assert.deepEqual(terminal.prompts, []);
+      } else assert.equal(terminal.attached.length, 0);
+    }
+  } finally {
+    for (const gate of gates) gate.resolve();
+    await Promise.allSettled(requests);
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Uncertain terminal topic creation is latched instead of retried by queued attachment requests", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-uncertain-topic-"));
+  const h = new Harness(join(directory, "state.json"));
+  const terminal = new TerminalSession("uncertain-full-session-id");
+  try {
+    await h.bindWorkspace();
+    await h.bridge.register(terminal, terminal.onAttach);
+    h.beforeCreateTopic = async () => { throw new Error("Telegram response lost after side effect"); };
+    const first = h.bridge.attach(terminal, "Unknown result");
+    const second = h.bridge.attach(terminal, "Do not retry");
+    await Promise.all([
+      assert.rejects(first, /Topic creation outcome is uncertain/),
+      assert.rejects(second, /Topic creation outcome is uncertain/),
+    ]);
+    await h.command(`/attach ${terminal.identity.sessionId}`, "Topic creation outcome is uncertain");
+    assert.equal(h.created.length, 1);
+    assert.equal(terminal.attached.length, 0);
+    assert.equal(h.opened.length, 0);
+  } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
   }

@@ -5,6 +5,8 @@ export interface Binding {
     cwd: string;
     sessionId?: string;
     sessionFile?: string;
+    /** Terminal-owned process: never spawn or resume it from this daemon. */
+    external?: true;
 }
 export interface UiRequest {
     id: string;
@@ -27,6 +29,14 @@ type Options = {
     botId: number;
     botUsername: string;
 };
+type TerminalIdentity = {
+    sessionId: string;
+    sessionFile: string;
+    cwd: string;
+};
+type TerminalBinding = Binding & TerminalIdentity & {
+    groupId: number;
+};
 export declare class WorkspaceBridge {
     private readonly options;
     private readonly api;
@@ -36,14 +46,25 @@ export declare class WorkspaceBridge {
     private stopping;
     private fatal?;
     private admitting;
+    private attaching;
     private writing;
     private readonly jobs;
     private readonly sessions;
+    private readonly terminals;
     private readonly pending;
     private readonly busy;
     private groupSetup;
     constructor(options: Options, api: Api, openSession: OpenSession);
     get offset(): number;
+    /** Registration is ephemeral: no topic creation, persistence, or implicit reattachment. */
+    register(port: SessionPort, onAttach: (binding: TerminalBinding) => Promise<void>): Promise<void>;
+    /** A separate queue keeps slow attachments out of Telegram admission/control handling. */
+    attach(port: SessionPort, label: string): Promise<TerminalBinding>;
+    detach(port: SessionPort): void;
+    private requireRegistration;
+    private readTerminal;
+    private terminalBinding;
+    private attachedBinding;
     init(): Promise<void>;
     /** Admit durably, then run turns in the background so controls stay responsive. */
     handle(update: unknown): Promise<void>;
@@ -53,9 +74,12 @@ export declare class WorkspaceBridge {
     private requireGroup;
     private requireBinding;
     private describe;
+    private topicLocation;
+    private externalRegistration;
     private assertIdentity;
     private session;
     private onUi;
+    private startTyping;
     private reply;
     private send;
     private complete;

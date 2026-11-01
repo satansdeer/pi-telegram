@@ -5,6 +5,10 @@
 ## Unreleased
 
 - `OMP Workspace`: Added an explicit standalone daemon with owner-only forum binding, generated chat IDs, one persistent OMP transcript per topic, concurrent topic routing, and topic-local status/abort/UI controls. Exact resume validation and durable admission prevent silent session replacement or crash replay; failed delivery does not rerun prompts. The upstream Pi adapter and separate IRC services remain unchanged.
+- `OMP directories`: `/new [name] --cwd directory` starts a chat in an existing project folder, resolving relative paths from the Workspace root and preserving the canonical working directory across restarts. Invalid directories are rejected before creating a topic; existing chat directories remain unchanged.
+- `OMP terminal attachment`: Native `/telegram-connect [name]` creates a Workspace topic for the same live OMP process and existing context; reconnect preserves its topic and transcript. Private authenticated local IPC keeps one bot poller. Busy-turn guards, fresh response capture, and identity fencing prevent mixed sessions. `/telegram-disconnect` leaves local work running; disconnected terminal topics never spawn or resume a replacement. Interactive dialogs stay local.
+- `Telegram-first attachment`: Native main terminals register without creating topics. Owner-only `/running` lists full IDs, folders, activity, and attachments; `/attach <full-session-id>` binds that exact live process and returns its topic link. Concurrent attaches reuse one topic. Daemon restarts rediscover terminals without replaying attachments or prompts; local disconnect opts out while work continues. Managed children stay out of discovery.
+- `OMP activity`: Workspace prompts now send and refresh Telegram's typing state in the exact topic while OMP runs, then stop it before reply delivery. Presence failures remain best effort and never fail or replay the prompt.
 
 ## 0.58.3: Typing Cancellation Diagnostics
 

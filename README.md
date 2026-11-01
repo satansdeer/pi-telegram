@@ -23,19 +23,43 @@ Fork of [`llblab/pi-telegram`](https://github.com/llblab/pi-telegram), with an e
 6. As the configured owner, send `/workspace` in the group. Binding verifies a forum supergroup and the bot's topic-management permission; another group cannot take it over.
 7. Send `/new project-name`; wait for **Chat created** in the new `[generated-id] project-name` topic, then send ordinary text there. `/bind [name]` inside an existing non-General topic designates a new session without replacing an existing binding.
 
-Only the configured owner can send prompts or controls. Topic content and OMP output are visible to **every group member**: use a private Workspace with trusted members. Each session has normal local OMP tool access and starts in `OMP_WORKSPACE_CWD`; this is not a sandbox.
+Only the configured owner can send prompts or controls. Topic content and OMP output are visible to **every group member**: use a private Workspace with trusted members. Each session has normal local OMP tool access; this is not a sandbox.
+
+To start in a project folder, send `/new --cwd slides-recorder-monorepo`. Relative paths resolve from `OMP_WORKSPACE_CWD`; absolute paths also work. The directory must already exist and is checked before creating a Telegram topic. Everything after `--cwd` is the literal path, including spaces; do not add shell quotes. The topic defaults to the directory name; use `/new Slides work --cwd slides-recorder-monorepo` for a custom name.
+
+Without `--cwd`, `/new [name]` still starts in `OMP_WORKSPACE_CWD`. Each chat saves its resolved working directory and keeps it across restarts, even if the default changes. Existing chats are not moved; `/status` shows their directory.
+
+### Attach an already-running terminal session
+
+After building this checkout, install its native OMP extension once:
+
+```bash
+omp plugin link /absolute/path/to/pi-telegram
+```
+
+OMP 18.13.3 requires a one-time restart/resume to load a newly installed or updated extension; `/reload-plugins` does not import new modules. Once loaded, a main terminal session registers automatically without creating a Telegram topic. In your Workspace group, send `/running` to see full session IDs, working directories, busy/idle state, and current topic attachments. Then send `/attach <full-session-id>` to create or reuse a generated-ID topic for that **same live OMP process**, with its existing context, transcript, and working directory. The reply includes its topic link. IDs must match exactly; prefixes are not accepted. It never spawns another OMP or resumes a copy of the transcript.
+
+Alternatively, run `/telegram-connect [name]` in the terminal, for example `/telegram-connect slides-recorder-monorepo`. Reattaching the same session reuses its topic. Daemon-owned sessions created by `/new` or `/bind` are not advertised as external terminals.
+
+The terminal extension uses the daemon's private local socket, not a second Telegram poller. Both must run as the same local user and use the same `OMP_WORKSPACE_STATE_DIR` (default `~/.config/omp-workspace`). The terminal needs no bot token.
+
+Send plain text in that topic to continue the session. A busy terminal or queued local work rejects incoming Telegram prompts rather than mixing turns; ordinary terminal input is blocked during a Telegram turn. `/abort` remains available. Interactive dialogs stay in the local terminal; Telegram `/answer` and `/cancel` are only for daemon-owned sessions.
+
+Run `/telegram-disconnect` locally to detach and remove the terminal from `/running`, without stopping it or aborting work. Discovery stays disabled until `/telegram-connect` or a new session lifecycle. Session switching, branching, and tree navigation detach the old identity and register the resulting session; shutdown removes it. If the daemon is absent or restarts, discovery reconnects silently, but topic attachment and prompts are **never replayed**. Use `/running` then `/attach <full-session-id>` (or `/telegram-connect` locally) to reconnect the designated session explicitly. Offline topics never spawn or resume a replacement. An interrupted request may have executed: inspect the terminal/transcript before manually sending it again.
 
 ### Controls and persistence
 
 - `/sessions`: chat IDs, topic IDs, OMP session IDs, transcript paths, and working directories.
+- `/running`: live terminal session IDs, working directories, busy/idle state, and topic attachments.
+- `/attach <full-session-id>`: create or reuse a topic for that exact registered terminal.
 - `/status`: this topic's designation, activity, and pending UI request IDs.
 - `/abort`: abort only this topic's active turn.
-- `/answer <request-id> <JSON object>` or `/cancel <request-id>`: resolve OMP UI requests in the same topic. For example, `/answer request-1 {"confirmed":true}`. Secret input must use a local terminal.
+- For daemon-owned sessions, `/answer <request-id> <JSON object>` or `/cancel <request-id>` resolves OMP UI requests in the same topic. For example, `/answer request-1 {"confirmed":true}`. Secret input and attached-terminal dialogs must use the local terminal.
 - `/help`: command reference. Other slash commands and attachments are not forwarded to OMP.
 
-Different topics run concurrently; a second prompt in an active topic is rejected, not queued. Final text is chunked into that exact topic. This daemon does not port the upstream Pi extension's media, previews, or menus.
+Different topics run concurrently; a second prompt in an active topic is rejected, not queued. While OMP handles a prompt, the daemon immediately sends and refreshes Telegram's typing state in that exact topic, then stops it before delivering the final text. Typing-state failures are best effort and do not fail the prompt. Final text is chunked into that exact topic. This daemon does not port the upstream Pi extension's media, previews, or menus.
 
-`state.json` stores the exact group/topic/chat/session identity, poll offset, and unfinished admissions with mode `0600`; isolated transcripts live under `sessions/<chat-id>/`. A restart resumes the recorded transcript, never silently substitutes a fresh session. Keep this directory when upgrading.
+`state.json` stores the exact group/topic/chat/session identity, terminal ownership, poll offset, and unfinished admissions with mode `0600`. Daemon-owned transcripts live under `sessions/<chat-id>/`; attached terminals retain their original transcript paths. A restart resumes daemon-owned transcripts exactly, while terminal-owned topics stay offline until explicitly reconnected. Neither path silently substitutes a fresh session. Keep this directory when upgrading.
 
 Telegram, OMP, and the local file cannot commit atomically. After a crash, unfinished updates are reported, **not replayed**; topic creation and prompts are never automatically retried. If initialization stopped before recording the OMP identity, inspect that chat's transcript directory and reconcile the binding manually rather than deleting state or creating a replacement.
 

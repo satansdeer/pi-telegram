@@ -93,6 +93,7 @@ export class OmpSession {
             if (/TELEGRAM.*TOKEN|BOT_?TOKEN|TOKEN.*TELEGRAM/i.test(key) || /^\d+:[\w-]{20,}$/.test(value ?? ""))
                 delete env[key];
         }
+        env.OMP_WORKSPACE_MANAGED = "1";
         this.onUi = options.onUi;
         this.child = spawn(options.binary, [
             ...(options.args ?? []), "--mode", "rpc", "--session-dir", directory,

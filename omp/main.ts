@@ -7,7 +7,9 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { OmpSession } from "./rpc.ts";
-import { WorkspaceBridge } from "./workspace.ts";
+import { startWorkspaceServer } from "./local.ts";
+import type { LocalPeer, WorkspaceServer } from "./local.ts";
+import { WorkspaceBridge, type SessionPort } from "./workspace.ts";
 
 const token = process.env.OMP_TELEGRAM_BOT_TOKEN?.trim();
 if (!token) throw new Error("Set OMP_TELEGRAM_BOT_TOKEN in a private environment file");
@@ -90,11 +92,48 @@ if (process.argv.includes("--check")) {
     await session.ready();
     return session;
   });
+  const terminals = new Map<LocalPeer, SessionPort>();
+  let local: WorkspaceServer | undefined;
   const shutdown = () => { stopping = true; polling.abort(); };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
   try {
     await bridge.init();
+    local = await startWorkspaceServer(stateDir, async (peer) => {
+      const port: SessionPort = {
+        async state() {
+          const state = await peer.request("state");
+          if (typeof state !== "object" || state === null || Array.isArray(state)) throw new Error("Invalid terminal session state");
+          return state as Record<string, unknown>;
+        },
+        async prompt(text) {
+          const response = await peer.request("prompt", { text });
+          if (typeof response !== "string") throw new Error("Invalid terminal response");
+          return response;
+        },
+        async abort() { await peer.request("abort"); },
+        async answer(id, response) { await peer.request("answer", { id, response }); },
+        async stop() { peer.close(); },
+      };
+      terminals.set(peer, port);
+      try {
+        await bridge.register(port, async (binding) => {
+          if (terminals.get(peer) !== port) throw new Error("Terminal disconnected before attachment completed");
+          const { id, threadId, name, groupId, sessionId, sessionFile, cwd } = binding;
+          await peer.request("attached", { id, threadId, name, groupId, sessionId, sessionFile, cwd });
+        });
+      }
+      catch (error) { terminals.delete(peer); await bridge.detach(port); throw error; }
+    }, async (peer, name) => {
+      const port = terminals.get(peer);
+      if (!port) throw new Error("Terminal is not registered");
+      const { id, threadId, name: label, groupId, sessionId, sessionFile, cwd: directory } = await bridge.attach(port, name);
+      return { id, threadId, name: label, groupId, sessionId, sessionFile, cwd: directory };
+    }, (peer) => {
+      const port = terminals.get(peer);
+      terminals.delete(peer);
+      if (port) bridge.detach(port);
+    });
     console.log(`Workspace ready: @${me.username}; owner ${ownerId}; cwd ${cwd}`);
     while (!stopping) {
       let updates: unknown;
@@ -116,6 +155,7 @@ if (process.argv.includes("--check")) {
   } finally {
     stopping = true;
     polling.abort();
+    await local?.close();
     await bridge.stop();
     await unlink(lockPath);
   }

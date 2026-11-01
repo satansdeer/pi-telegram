@@ -4,14 +4,17 @@
  * Owns no polling or API transport. Topics and transcripts are never deleted or replaced.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { getTelegramTargetThreadParams } from "../lib/target.js";
+const TYPING_REFRESH_MS = 3_000;
 const HELP = [
     "/workspace — bind this forum supergroup once (bot must manage topics)",
-    "/new [name] — create a new topic and designated OMP transcript",
+    "/new [name] [--cwd directory] — create a topic/session; relative directories start at the Workspace root",
     "/bind [name] — adopt this existing non-General topic",
     "/sessions — list chat IDs, Telegram topics, and OMP sessions",
+    "/running — list live terminals without creating topics",
+    "/attach <full-session-id> — attach that exact live terminal to a topic",
     "/status — show this topic's session and pending UI requests",
     "/abort — interrupt this topic's active turn",
     "/answer <request-id> <JSON object> — answer this topic's pending UI request",
@@ -35,6 +38,24 @@ function text(value) {
 }
 function keys(value, allowed) {
     return Object.keys(value).every((key) => allowed.includes(key));
+}
+async function canonicalFile(path) {
+    try {
+        return await realpath(path);
+    }
+    catch (error) {
+        if (record(error) && error.code === "ENOENT")
+            return resolve(await canonicalFile(dirname(path)), basename(path));
+        throw error;
+    }
+}
+function terminalIdentity(state) {
+    if (!record(state) || !text(state.sessionId) || /\s/.test(state.sessionId)
+        || !text(state.sessionFile) || !isAbsolute(state.sessionFile)
+        || !text(state.cwd) || !isAbsolute(state.cwd)) {
+        throw new Error("Terminal must have a persistent session identity and absolute sessionFile and cwd");
+    }
+    return { sessionId: state.sessionId, sessionFile: state.sessionFile, cwd: state.cwd };
 }
 function diagnostic(error) {
     return (error instanceof Error ? error.message : "Unknown processing error")
@@ -66,7 +87,7 @@ function parseState(value, options) {
     const sessionIds = new Set();
     const sessionFiles = new Set();
     for (const binding of value.bindings) {
-        if (!record(binding) || !keys(binding, ["id", "threadId", "name", "cwd", "sessionId", "sessionFile"]))
+        if (!record(binding) || !keys(binding, ["id", "threadId", "name", "cwd", "sessionId", "sessionFile", "external"]))
             return invalid();
         if (typeof binding.id !== "string" || !/^[a-f0-9]{12}$/.test(binding.id) || !integer(binding.threadId, 2)
             || !text(binding.name) || [...binding.name].length > 128 || !text(binding.cwd) || !isAbsolute(binding.cwd)
@@ -75,6 +96,8 @@ function parseState(value, options) {
         if ((binding.sessionId === undefined) !== (binding.sessionFile === undefined))
             return invalid();
         if (binding.sessionId !== undefined && (!text(binding.sessionId) || !text(binding.sessionFile) || !isAbsolute(binding.sessionFile)))
+            return invalid();
+        if (binding.external !== undefined && (binding.external !== true || binding.sessionId === undefined))
             return invalid();
         if (binding.sessionId !== undefined) {
             if (sessionIds.has(binding.sessionId) || sessionFiles.has(resolve(binding.sessionFile)))
@@ -145,9 +168,11 @@ export class WorkspaceBridge {
     stopping = false;
     fatal;
     admitting = Promise.resolve();
+    attaching = Promise.resolve();
     writing = Promise.resolve();
     jobs = new Set();
     sessions = new Map();
+    terminals = new Map();
     pending = new Map();
     busy = new Set();
     groupSetup = false;
@@ -160,6 +185,139 @@ export class WorkspaceBridge {
         this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
     }
     get offset() { return this.data.offset; }
+    /** Registration is ephemeral: no topic creation, persistence, or implicit reattachment. */
+    async register(port, onAttach) {
+        if (!this.initialized || this.stopping || this.fatal)
+            throw this.fatal ?? new Error("Workspace is not ready");
+        if (this.terminals.has(port))
+            throw new Error("Terminal is already registered");
+        const registration = { onAttach };
+        this.terminals.set(port, registration);
+        try {
+            const identity = terminalIdentity(await port.state());
+            const file = await canonicalFile(identity.sessionFile);
+            this.requireRegistration(port, registration);
+            for (const [other, entry] of this.terminals) {
+                if (other !== port && entry.identity && (entry.identity.sessionId === identity.sessionId || entry.canonicalFile === file)) {
+                    throw new Error("This transcript already has a live terminal owner");
+                }
+            }
+            registration.identity = identity;
+            registration.canonicalFile = file;
+            await this.terminalBinding(identity, file);
+            this.requireRegistration(port, registration);
+            registration.registered = true;
+        }
+        catch (error) {
+            if (this.terminals.get(port) === registration)
+                this.detach(port);
+            throw error;
+        }
+    }
+    /** A separate queue keeps slow attachments out of Telegram admission/control handling. */
+    attach(port, label) {
+        const registration = this.terminals.get(port);
+        if (!registration?.registered)
+            return Promise.reject(new Error("Terminal is not registered; reconnect it before attaching"));
+        const attached = this.attaching.then(async () => {
+            this.requireRegistration(port, registration);
+            if (this.data.groupId === undefined)
+                throw new Error("Send /workspace in your Telegram forum group first");
+            const identity = terminalIdentity(await this.readTerminal(port, registration));
+            let binding = await this.terminalBinding(identity, registration.canonicalFile);
+            this.requireRegistration(port, registration);
+            if (binding && registration.bindingId === binding.id && this.sessions.has(binding.id))
+                return this.attachedBinding(binding);
+            if (binding && (this.sessions.has(binding.id) || this.busy.has(binding.threadId))) {
+                throw new Error("This transcript already has a live connection or an unsettled turn");
+            }
+            if (!binding) {
+                if (registration.topicFailure)
+                    throw registration.topicFailure;
+                let id;
+                do {
+                    id = randomBytes(6).toString("hex");
+                } while (this.data.bindings.some((entry) => entry.id === id));
+                const prefix = `[${id}] `;
+                const name = [...(label.replace(/\s+/g, " ").trim() || basename(identity.cwd))].slice(0, 128 - prefix.length).join("");
+                let threadId;
+                try {
+                    // Latch uncertain outcomes: queued requests must not create a second topic.
+                    const topic = await this.api("createForumTopic", { chat_id: this.data.groupId, name: `${prefix}${name}` });
+                    if (!record(topic) || !integer(topic.message_thread_id, 2)
+                        || this.data.bindings.some((entry) => entry.threadId === topic.message_thread_id))
+                        throw new Error("Invalid or already-bound topic");
+                    threadId = topic.message_thread_id;
+                }
+                catch (error) {
+                    registration.topicFailure = new Error(`Topic creation outcome is uncertain; inspect Telegram before reconnecting. ${diagnostic(error)}`);
+                    throw registration.topicFailure;
+                }
+                binding = { id, threadId, name, ...identity, external: true };
+                // Retain a known created topic even if its terminal disconnected during the call.
+                this.data.bindings.push(binding);
+                await this.save();
+            }
+            await this.readTerminal(port, registration);
+            const attached = this.attachedBinding(binding);
+            await registration.onAttach(attached);
+            await this.readTerminal(port, registration);
+            this.sessions.set(binding.id, Promise.resolve(port));
+            registration.bindingId = binding.id;
+            await this.send({ chatId: attached.groupId, threadId: binding.threadId }, `Terminal connected (same live OMP session).\n${this.describe(binding)}\nInteractive dialogs stay in the terminal.`);
+            this.requireRegistration(port, registration);
+            return attached;
+        });
+        this.attaching = attached.then(() => { }, () => { });
+        return attached;
+    }
+    detach(port) {
+        const registration = this.terminals.get(port);
+        if (registration?.bindingId !== undefined)
+            this.sessions.delete(registration.bindingId);
+        this.terminals.delete(port);
+    }
+    requireRegistration(port, registration) {
+        if (this.stopping || this.fatal || this.terminals.get(port) !== registration) {
+            throw this.fatal ?? new Error("Terminal registration is no longer live; reconnect before attaching");
+        }
+    }
+    async readTerminal(port, registration) {
+        this.requireRegistration(port, registration);
+        try {
+            const state = await port.state();
+            const identity = terminalIdentity(state);
+            const file = await canonicalFile(identity.sessionFile);
+            this.requireRegistration(port, registration);
+            const expected = registration.identity;
+            if (!expected || identity.sessionId !== expected.sessionId || identity.sessionFile !== expected.sessionFile
+                || identity.cwd !== expected.cwd || file !== registration.canonicalFile) {
+                throw new Error("Terminal identity changed; reconnect the designated session before using /running or /attach");
+            }
+            return { ...state, ...identity };
+        }
+        catch (error) {
+            if (this.terminals.get(port) === registration)
+                this.detach(port);
+            throw error;
+        }
+    }
+    async terminalBinding(identity, file) {
+        let found;
+        for (const binding of this.data.bindings) {
+            if (binding.sessionId !== identity.sessionId
+                && (binding.sessionFile === undefined || await canonicalFile(binding.sessionFile) !== file))
+                continue;
+            if (!binding.external || binding.sessionId !== identity.sessionId || binding.sessionFile !== identity.sessionFile || binding.cwd !== identity.cwd) {
+                throw new Error("Transcript is already designated to a different session owner");
+            }
+            found = binding;
+        }
+        return found;
+    }
+    attachedBinding(binding) {
+        return { ...binding, groupId: this.data.groupId, sessionId: binding.sessionId, sessionFile: binding.sessionFile };
+    }
     async init() {
         if (this.initialized)
             throw new Error("Workspace already initialized");
@@ -300,7 +458,16 @@ export class WorkspaceBridge {
                 await this.assertIdentity(binding, session);
                 admission.phase = "running";
                 await this.save();
-                const output = await session.prompt(message.text);
+                if (binding.external)
+                    this.externalRegistration(binding, session);
+                const stopTyping = this.startTyping(admission.target);
+                let output;
+                try {
+                    output = await session.prompt(message.text);
+                }
+                finally {
+                    stopTyping();
+                }
                 await this.reply(admission, output || "OMP completed without a text reply.");
             }
             await this.complete(admission);
@@ -334,7 +501,7 @@ export class WorkspaceBridge {
             if (this.data.groupId !== undefined) {
                 if (target.chatId !== this.data.groupId)
                     throw new Error("Workspace is already bound to a different group; rebinding is refused");
-                await this.reply(admission, `Workspace is bound to group ${this.data.groupId}. Use /new [name] or /bind in an existing topic.`);
+                await this.reply(admission, `Workspace is bound to group ${this.data.groupId}. Use /running and /attach <full-session-id>, /new [name], or /bind in an existing topic.`);
                 return;
             }
             const chat = await this.api("getChat", { chat_id: target.chatId });
@@ -346,12 +513,51 @@ export class WorkspaceBridge {
                 throw new Error("Bot must be an administrator with can_manage_topics");
             this.data.groupId = target.chatId;
             await this.save();
-            await this.reply(admission, "Workspace bound. Use /new [name] to create a chat topic, or /bind inside an existing non-General topic.");
+            await this.reply(admission, "Workspace bound. Use /running and /attach <full-session-id> for a live terminal, /new [name] to create a chat topic, or /bind inside an existing non-General topic.");
             return;
         }
-        if (!["new", "bind", "sessions", "status", "abort", "answer", "cancel"].includes(command.name))
+        if (!["new", "bind", "running", "attach", "sessions", "status", "abort", "answer", "cancel"].includes(command.name))
             throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
         this.requireGroup(target);
+        if (command.name === "running") {
+            if (command.argument)
+                throw new Error("Usage: /running");
+            const running = [];
+            for (const [port, registration] of this.terminals) {
+                if (!registration.registered)
+                    continue;
+                let state;
+                try {
+                    state = await this.readTerminal(port, registration);
+                }
+                catch {
+                    continue;
+                }
+                const binding = this.data.bindings.find((entry) => entry.id === registration.bindingId);
+                const active = state.isStreaming === true || (binding !== undefined && this.busy.has(binding.threadId));
+                running.push(`OMP session: ${state.sessionId}\nCwd: ${state.cwd}\n${active ? "Busy" : "Idle"}\n${binding ? this.topicLocation(binding) : "Telegram topic: not attached"}`);
+            }
+            await this.reply(admission, running.length ? running.join("\n\n") : "No live terminals registered. Open OMP in a terminal to make it discoverable, then use /running and /attach <full-session-id>.");
+            return;
+        }
+        if (command.name === "attach") {
+            if (!/^\S+$/.test(command.argument))
+                throw new Error("Usage: /attach <full-session-id>");
+            let entry;
+            for (const candidate of this.terminals) {
+                if (candidate[1].registered && candidate[1].identity?.sessionId === command.argument) {
+                    entry = candidate;
+                    break;
+                }
+            }
+            if (!entry)
+                throw new Error("No live terminal with that exact full session ID. Use /running; prefix matching and automatic spawn/resume are forbidden");
+            admission.phase = "running";
+            await this.save();
+            const binding = await this.attach(entry[0], basename(entry[1].identity.cwd));
+            await this.reply(admission, `Terminal attached.\n${this.describe(binding)}\n${this.topicLocation(binding)}`);
+            return;
+        }
         if (command.name === "new" || command.name === "bind") {
             if (command.name === "bind") {
                 if (!integer(target.threadId, 2))
@@ -362,12 +568,24 @@ export class WorkspaceBridge {
                     return;
                 }
             }
+            let argument = command.argument;
+            let cwd = this.options.cwd;
+            const directoryOption = command.name === "new" ? /(?:^|\s)--cwd(?:\s+|$)/.exec(argument) : null;
+            if (directoryOption) {
+                const directory = argument.slice(directoryOption.index + directoryOption[0].length).trim();
+                if (!directory)
+                    throw new Error("/new --cwd requires a directory");
+                cwd = await realpath(resolve(this.options.cwd, directory));
+                if (!(await stat(cwd)).isDirectory())
+                    throw new Error("The selected working directory is not a directory");
+                argument = argument.slice(0, directoryOption.index).trim() || basename(cwd);
+            }
             let id;
             do {
                 id = randomBytes(6).toString("hex");
             } while (this.data.bindings.some((binding) => binding.id === id));
             const prefix = `[${id}] `;
-            const name = [...(command.argument.replace(/\s+/g, " ").trim() || "Chat")].slice(0, 128 - prefix.length).join("");
+            const name = [...(argument.replace(/\s+/g, " ").trim() || "Chat")].slice(0, 128 - prefix.length).join("");
             let threadId = target.threadId;
             if (command.name === "new") {
                 admission.phase = "running";
@@ -380,7 +598,7 @@ export class WorkspaceBridge {
                 if (this.data.bindings.some((binding) => binding.threadId === threadId))
                     throw new Error("Created topic is already bound; refusing to replace its session");
             }
-            const binding = { id, threadId: threadId, name, cwd: this.options.cwd };
+            const binding = { id, threadId: threadId, name, cwd };
             this.data.bindings.push(binding);
             this.busy.add(binding.threadId);
             await this.save();
@@ -400,13 +618,19 @@ export class WorkspaceBridge {
         const binding = this.requireBinding(target);
         if (command.name === "status") {
             const requests = [...(this.pending.get(binding.id)?.keys() ?? [])];
-            await this.reply(admission, `${this.describe(binding)}\n${this.busy.has(binding.threadId) ? "Busy" : "Idle"}\nPending UI: ${requests.join(", ") || "none"}`);
+            const live = binding.external ? this.sessions.get(binding.id) : undefined;
+            const active = this.busy.has(binding.threadId) || (live !== undefined && (await (await live).state()).isStreaming === true);
+            await this.reply(admission, `${this.describe(binding)}\n${active ? "Busy" : "Idle"}\nPending UI: ${binding.external ? "use the local terminal for interactive dialogs" : requests.join(", ") || "none"}`);
             return;
         }
         if (command.name === "abort") {
             const live = this.sessions.get(binding.id);
             if (live) {
-                await (await live).abort();
+                const session = await live;
+                await this.assertIdentity(binding, session);
+                if (binding.external)
+                    this.externalRegistration(binding, session);
+                await session.abort();
                 await this.reply(admission, "Abort requested for this topic only.");
             }
             else
@@ -451,9 +675,24 @@ export class WorkspaceBridge {
         return binding;
     }
     describe(binding) {
-        return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (automatic replacement refused)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}`;
+        return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (automatic replacement refused)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}${binding.external ? `\nTerminal: ${this.sessions.has(binding.id) ? "connected" : "offline — reopen the designated terminal, use /running and /attach <full-session-id>, or /telegram-connect there"}` : ""}`;
+    }
+    topicLocation(binding) {
+        const group = String(this.data.groupId);
+        return `Telegram topic: ${binding.threadId}${group.startsWith("-100") && group.length > 4 ? `\nhttps://t.me/c/${group.slice(4)}/${binding.threadId}` : `\nGroup: ${group}`}`;
+    }
+    externalRegistration(binding, session) {
+        const registration = this.terminals.get(session);
+        if (!registration?.registered || registration.bindingId !== binding.id)
+            throw new Error("Designated terminal is offline; use /running and /attach <full-session-id>");
+        this.requireRegistration(session, registration);
+        return registration;
     }
     async assertIdentity(binding, session) {
+        if (binding.external) {
+            await this.readTerminal(session, this.externalRegistration(binding, session));
+            return;
+        }
         const state = await session.state();
         if (state.sessionId !== binding.sessionId || state.sessionFile !== binding.sessionFile)
             throw new Error("OMP session identity differs from the designated transcript; refusing input");
@@ -464,6 +703,8 @@ export class WorkspaceBridge {
             return existing;
         if (this.stopping)
             throw new Error("Workspace is stopping");
+        if (binding.external)
+            throw new Error("Designated terminal is offline. Reopen that same session, use /running and /attach <full-session-id>, or /telegram-connect there; automatic spawn/resume is forbidden");
         if (!create && (!binding.sessionId || !binding.sessionFile))
             throw new Error("Session initialization was interrupted; no designated transcript was recorded. Automatic replacement is refused");
         const opening = (async () => {
@@ -477,9 +718,17 @@ export class WorkspaceBridge {
                 if (!create && (state.sessionId !== binding.sessionId || state.sessionFile !== binding.sessionFile))
                     throw new Error("OMP resumed a different transcript; refusing to replace the designated session");
                 if (create) {
-                    if (this.data.bindings.some((other) => other !== binding && (other.sessionId === state.sessionId
-                        || (other.sessionFile !== undefined && resolve(other.sessionFile) === resolve(state.sessionFile))))) {
-                        throw new Error("OMP returned a transcript already designated to another topic; refusing shared sessions");
+                    const file = await canonicalFile(state.sessionFile);
+                    for (const other of this.data.bindings) {
+                        if (other !== binding && (other.sessionId === state.sessionId
+                            || (other.sessionFile !== undefined && await canonicalFile(other.sessionFile) === file))) {
+                            throw new Error("OMP returned a transcript already designated to another topic; refusing shared sessions");
+                        }
+                    }
+                    for (const registration of this.terminals.values()) {
+                        if (registration.identity && (registration.identity.sessionId === state.sessionId || registration.canonicalFile === file)) {
+                            throw new Error("OMP returned a transcript owned by a registered live terminal; refusing shared sessions");
+                        }
                     }
                     binding.sessionId = state.sessionId;
                     binding.sessionFile = state.sessionFile;
@@ -527,6 +776,36 @@ export class WorkspaceBridge {
         else if (request.method === "notify" && typeof request.message === "string") {
             this.track(this.send(target, `OMP: ${request.message}`).catch((error) => console.error(`Workspace UI delivery failed: ${diagnostic(error)}`)));
         }
+    }
+    startTyping(target) {
+        let stopped = false;
+        let sending = false;
+        let failureReported = false;
+        const refresh = async () => {
+            if (stopped || sending)
+                return;
+            sending = true;
+            try {
+                await this.api("sendChatAction", { chat_id: target.chatId, ...getTelegramTargetThreadParams(target), action: "typing" });
+                failureReported = false;
+            }
+            catch (error) {
+                if (!stopped && !failureReported) {
+                    failureReported = true;
+                    console.error(`Workspace typing action failed: ${diagnostic(error)}`);
+                }
+            }
+            finally {
+                sending = false;
+            }
+        };
+        void refresh();
+        const timer = setInterval(() => void refresh(), TYPING_REFRESH_MS);
+        timer.unref();
+        return () => {
+            stopped = true;
+            clearInterval(timer);
+        };
     }
     async reply(admission, body, target = admission.target) {
         admission.phase = "delivery";
@@ -586,7 +865,10 @@ export class WorkspaceBridge {
     }
     async stop() {
         this.stopping = true;
+        for (const port of this.terminals.keys())
+            this.detach(port);
         await this.admitting;
+        await this.attaching;
         const opened = await Promise.allSettled([...this.sessions.values()]);
         const shutdowns = await Promise.allSettled(opened.flatMap((result) => result.status === "fulfilled" ? [result.value.stop()] : []));
         const failures = [...opened, ...shutdowns].filter((result) => result.status === "rejected").map((result) => result.reason);
