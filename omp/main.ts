@@ -6,6 +6,7 @@ import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { downloadTelegramFile } from "../lib/telegram-api.ts";
 import { OmpSession } from "./rpc.ts";
 import { startWorkspaceServer } from "./local.ts";
 import type { LocalPeer, WorkspaceServer } from "./local.ts";
@@ -91,7 +92,9 @@ if (process.argv.includes("--check")) {
     });
     await session.ready();
     return session;
-  });
+  }, (fileId, fileName, directory) => downloadTelegramFile(token, fileId, fileName, directory, {
+    maxFileSizeBytes: 20 * 1024 * 1024,
+  }));
   const terminals = new Map<LocalPeer, SessionPort>();
   let local: WorkspaceServer | undefined;
   const shutdown = () => { stopping = true; polling.abort(); };

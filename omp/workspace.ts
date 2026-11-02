@@ -5,7 +5,14 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  appendTelegramAttachmentSection,
+  buildTelegramReplyContextBlock,
+  downloadTelegramMessageFiles,
+  extractTelegramMessageText,
+} from "../lib/media.ts";
+import type { DownloadedTelegramMessageFile, TelegramAttachmentSource, TelegramMediaMessage } from "../lib/media.ts";
 import { getTelegramTargetThreadParams } from "../lib/target.ts";
 import type { TelegramTarget } from "../lib/target.ts";
 
@@ -36,6 +43,7 @@ export interface SessionPort {
 type Api = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 const TYPING_REFRESH_MS = 3_000;
 type OpenSession = (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort>;
+type DownloadFile = (fileId: string, fileName: string, directory: string) => Promise<string>;
 type Options = { statePath: string; cwd: string; ownerId: number; botId: number; botUsername: string };
 type Admission = {
   updateId: number;
@@ -78,10 +86,11 @@ const HELP = [
   "/answer <request-id> <JSON object> — answer this topic's pending UI request",
   "/cancel <request-id> — cancel this topic's pending UI request",
   "/help — show these commands",
-  "Only the configured owner can send input. Plain text in an idle topic starts a turn; additional plain text steers its active turn. Attachments and other slash commands are not forwarded.",
+  "Only the configured owner can send input. Plain text or supported files in an idle topic start a turn; additional input steers its active turn. Reply to or forward an older file to recover it into the local attachment archive. Other slash commands are not forwarded.",
 ].join("\n");
 const DIALOGS: Record<string, true> = { confirm: true, select: true, input: true, editor: true, ask: true };
-const ATTACHMENTS = ["photo", "animation", "audio", "document", "video", "video_note", "voice", "sticker", "contact", "location", "venue", "poll", "dice", "paid_media"];
+const SUPPORTED_ATTACHMENTS = ["photo", "animation", "audio", "document", "video", "voice", "sticker"];
+const ATTACHMENTS = [...SUPPORTED_ATTACHMENTS, "video_note", "contact", "location", "venue", "poll", "dice", "paid_media"];
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -97,6 +106,9 @@ function text(value: unknown): value is string {
 }
 function keys(value: Record<string, unknown>, allowed: string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
+}
+function hasAttachment(message: Record<string, unknown>, kinds = ATTACHMENTS): boolean {
+  return kinds.some((key) => message[key] !== undefined);
 }
 function escapeHtml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -200,6 +212,7 @@ export class WorkspaceBridge {
   private readonly options: Options;
   private readonly api: Api;
   private readonly openSession: OpenSession;
+  private readonly downloadFile: DownloadFile;
   private data: State;
   private initialized = false;
   private stopping = false;
@@ -215,11 +228,12 @@ export class WorkspaceBridge {
   private readonly starts = new Map<number, Promise<void>>();
   private groupSetup = false;
 
-  constructor(options: Options, api: Api, openSession: OpenSession) {
+  constructor(options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile) {
     if (!integer(options.ownerId) || !integer(options.botId) || !/^[A-Za-z0-9_]+$/.test(options.botUsername)) throw new Error("Invalid Workspace bot/owner identity");
     this.options = { ...options, statePath: resolve(options.statePath), cwd: resolve(options.cwd) };
     this.api = api;
     this.openSession = openSession;
+    this.downloadFile = downloadFile;
     this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
   }
   get offset(): number { return this.data.offset; }
@@ -396,12 +410,14 @@ export class WorkspaceBridge {
     this.data.offset = update.update_id + 1;
     const message = record(update.message) ? update.message : undefined;
     const target = message && targetOf(message);
-    if (!message || !target || !(typeof message.text === "string" || ATTACHMENTS.some((key) => message[key] !== undefined))) {
+    if (!message || !target || !(typeof message.text === "string" || hasAttachment(message))) {
       await this.save();
       return;
     }
-    const input = typeof message.text === "string" ? message.text : "";
-    const commandInput = input.trimStart();
+    const input = typeof message.text === "string" ? message.text : typeof message.caption === "string" ? message.caption : "";
+    const hasPrompt = Boolean(input.trim() || hasAttachment(message, SUPPORTED_ATTACHMENTS)
+      || (record(message.reply_to_message) && hasAttachment(message.reply_to_message, SUPPORTED_ATTACHMENTS)));
+    const commandInput = typeof message.text === "string" ? message.text.trimStart() : "";
     const match = /^\/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(commandInput);
     const command = commandInput.startsWith("/") ? {
       name: match?.[1]?.toLowerCase() ?? "unknown",
@@ -415,7 +431,7 @@ export class WorkspaceBridge {
     let setup = false;
     let steeringReady: Promise<void> | undefined;
     let turnStarted: (() => void) | undefined;
-    if (owner && !command && input.trim() && target.chatId === this.data.groupId && target.threadId !== undefined
+    if (owner && !command && hasPrompt && target.chatId === this.data.groupId && target.threadId !== undefined
       && this.data.bindings.some((binding) => binding.threadId === target.threadId)) {
       const count = this.busy.get(target.threadId);
       if (count !== undefined) {
@@ -443,7 +459,7 @@ export class WorkspaceBridge {
     }
     const admission: Admission = {
       updateId: update.update_id, target,
-      kind: refusal ? "refusal" : command?.name ?? (steeringReady ? "steer" : input ? "prompt" : "attachment"),
+      kind: refusal ? "refusal" : command?.name ?? (steeringReady ? "steer" : hasPrompt ? "prompt" : "attachment"),
       phase: "admitted",
     };
     this.data.admissions.push(admission);
@@ -466,37 +482,43 @@ export class WorkspaceBridge {
     try {
       if (refusal) await this.reply(admission, refusal);
       else if (command) await this.command(admission, command);
-      else if (typeof message.text !== "string") await this.reply(admission, "Attachments are unsupported. Send a plain-text message inside a bound topic.");
-      else if (!message.text.trim()) await this.reply(admission, "Send a non-empty plain-text message.");
-      else if (admission.kind === "steer") {
-        await steeringReady;
-        this.requireGroup(admission.target);
-        const binding = this.requireBinding(admission.target);
-        const session = await this.session(binding);
-        await this.assertIdentity(binding, session);
-        admission.phase = "running";
-        await this.save();
-        if (binding.external) this.externalRegistration(binding, session);
-        await session.steer(message.text);
-        await this.reply(admission, "↪️ Steering applied to the active turn.");
+      else if (hasAttachment(message) && !hasAttachment(message, SUPPORTED_ATTACHMENTS)
+        && !(record(message.reply_to_message) && hasAttachment(message.reply_to_message, SUPPORTED_ATTACHMENTS))) {
+        await this.reply(admission, "This attachment type is unsupported. Send a photo, document, video, audio/voice, animation, or sticker.");
       } else {
-        this.requireGroup(admission.target);
-        const binding = this.requireBinding(admission.target);
-        const session = await this.session(binding);
-        await this.assertIdentity(binding, session);
-        admission.phase = "running";
-        await this.save();
-        if (binding.external) this.externalRegistration(binding, session);
-        const stopTyping = this.startTyping(admission.target);
-        let output: string;
-        try {
-          const prompt = session.prompt(message.text);
-          turnStarted?.();
-          output = await prompt;
-        } finally {
-          stopTyping();
+        const promptText = await this.attachmentPrompt(message, admission.target);
+        if (!promptText.trim()) {
+          await this.reply(admission, "Send non-empty text or a supported attachment.");
+        } else if (admission.kind === "steer") {
+          await steeringReady;
+          this.requireGroup(admission.target);
+          const binding = this.requireBinding(admission.target);
+          const session = await this.session(binding);
+          await this.assertIdentity(binding, session);
+          admission.phase = "running";
+          await this.save();
+          if (binding.external) this.externalRegistration(binding, session);
+          await session.steer(promptText);
+          await this.reply(admission, "↪️ Steering applied to the active turn.");
+        } else {
+          this.requireGroup(admission.target);
+          const binding = this.requireBinding(admission.target);
+          const session = await this.session(binding);
+          await this.assertIdentity(binding, session);
+          admission.phase = "running";
+          await this.save();
+          if (binding.external) this.externalRegistration(binding, session);
+          const stopTyping = this.startTyping(admission.target);
+          let output: string;
+          try {
+            const prompt = session.prompt(promptText);
+            turnStarted?.();
+            output = await prompt;
+          } finally {
+            stopTyping();
+          }
+          await this.reply(admission, output || "OMP completed without a text reply.");
         }
-        await this.reply(admission, output || "OMP completed without a text reply.");
       }
       await this.complete(admission);
     } catch (error) {
@@ -517,6 +539,43 @@ export class WorkspaceBridge {
       }
     }
   }
+  private attachmentArchive(target: TelegramTarget): string {
+    return join(dirname(this.options.statePath), "attachments", String(target.chatId), String(target.threadId ?? 0));
+  }
+
+  private async attachmentFiles(message: TelegramMediaMessage, target: TelegramTarget) {
+    return downloadTelegramMessageFiles([message], {
+      downloadFile: (fileId: string, fileName: string, source?: TelegramAttachmentSource) => {
+        if (!source || !integer(source.messageId)) throw new Error("Telegram attachment has no valid message ID");
+        return this.downloadFile(fileId, fileName, join(this.attachmentArchive(target), String(source.messageId)));
+      },
+    });
+  }
+
+  private async attachmentPrompt(message: Record<string, unknown>, target: TelegramTarget): Promise<string> {
+    const media = message as unknown as TelegramMediaMessage;
+    let files: DownloadedTelegramMessageFile[] = [];
+    if (hasAttachment(message, SUPPORTED_ATTACHMENTS)) {
+      if (!integer(message.message_id)) throw new Error("Telegram attachment has no valid message ID");
+      files = await this.attachmentFiles(media, target);
+    }
+    let replyFiles: DownloadedTelegramMessageFile[] = [];
+    const reply = record(message.reply_to_message) ? message.reply_to_message : undefined;
+    if (reply && hasAttachment(reply, SUPPORTED_ATTACHMENTS)) {
+      if (!integer(reply.message_id)) throw new Error("Replied attachment has no valid message ID");
+      replyFiles = await this.attachmentFiles({
+        ...reply,
+        message_id: reply.message_id,
+        ...(media.chat ? { chat: media.chat } : {}),
+      } as TelegramMediaMessage, target);
+    }
+    let prompt = appendTelegramAttachmentSection(extractTelegramMessageText(media), files);
+    const replyContext = buildTelegramReplyContextBlock(media, replyFiles);
+    if (replyContext) prompt = prompt ? `${prompt}\n\n${replyContext}` : `_\n\n${replyContext}`;
+    if (files.length || replyFiles.length) prompt += `\n\n[chat-attachments] ${this.attachmentArchive(target)}`;
+    return prompt;
+  }
+
 
   private async command(admission: Admission, command: Command): Promise<void> {
     const target = admission.target;

@@ -11,7 +11,7 @@
 - `OMP activity`: Workspace prompts now send and refresh Telegram's typing state in the exact topic while OMP runs, then stop it before reply delivery. Presence failures remain best effort and never fail or replay the prompt.
 - `OMP sidecar questions`: `/btw <question>` now runs OMP's ephemeral side-turn pipeline against the topic's current context without appending the exchange to the main transcript. Side turns can run alongside the main turn, retain exact session ownership, refresh topic-local typing state, and return escaped quoted `💭 Sidecar` messages.
 - `OMP graceful restart`: `npm run omp:restart` now signals the macOS service to stop polling, finish accepted prompts and side questions through Telegram delivery, then exit. Launchd `KeepAlive` starts the built replacement only after the drain; routine upgrades no longer abort the turn that requested their deployment.
-- `OMP steering`: Additional plain-text messages sent while a topic's main turn is active now use OMP's native steering queue for that exact session instead of being rejected. Telegram acknowledges accepted steering with `↪️`; the steering message remains part of the main transcript, while `/btw` stays ephemeral.
+- `OMP steering and files`: Additional text and supported attachments sent during a topic's active turn now use OMP's native steering queue for that exact session; idle input starts a turn. Files are archived by chat/topic/message and prompts expose the archive root for later scans. Replying to or forwarding an older Telegram file recovers it when Bot API history is unavailable. Telegram acknowledges steering with `↪️`; `/btw` stays ephemeral.
 
 ## 0.58.3: Typing Cancellation Diagnostics
 

@@ -108,6 +108,7 @@ class Harness {
   readonly sessions = new Map<number, FakeSession>();
   readonly ui = new Map<number, (request: UiRequest) => void>();
   readonly created: Array<Record<string, unknown>> = [];
+  readonly downloads: Array<{ fileId: string; fileName: string; directory: string; path: string }> = [];
   private readonly listeners = new Set<() => void>();
   private updateId: number;
   private nextThread = 100;
@@ -140,10 +141,27 @@ class Harness {
       const session = new FakeSession(binding, () => { for (const listener of this.listeners) listener(); });
       this.sessions.set(binding.threadId, session);
       return session;
+    }, async (fileId, fileName, directory) => {
+      const path = join(directory, fileName);
+      this.downloads.push({ fileId, fileName, directory, path });
+      return path;
     });
   }
+  incoming(fields: Record<string, unknown>, threadId?: number, ownerId = OWNER, groupId = GROUP): Record<string, unknown> {
+    const updateId = this.updateId++;
+    return {
+      update_id: updateId,
+      message: {
+        message_id: updateId + 1,
+        from: { id: ownerId },
+        chat: { id: groupId, type: "supergroup" },
+        ...(threadId === undefined ? {} : { message_thread_id: threadId, is_topic_message: true }),
+        ...fields,
+      },
+    };
+  }
   update(body: string, threadId?: number, ownerId = OWNER, groupId = GROUP): Record<string, unknown> {
-    return { update_id: this.updateId++, message: { from: { id: ownerId }, chat: { id: groupId, type: "supergroup" }, text: body, ...(threadId === undefined ? {} : { message_thread_id: threadId, is_topic_message: true }) } };
+    return this.incoming({ text: body }, threadId, ownerId, groupId);
   }
   async dispatch(body: string, threadId?: number, ownerId = OWNER, groupId = GROUP): Promise<void> {
     await this.bridge.handle(this.update(body, threadId, ownerId, groupId));
@@ -320,14 +338,53 @@ test("Workspace rejects unauthorized/unbound input, ignores other bot commands, 
     await h.reply("Unsupported slash command", 101);
     assert.equal(h.created.length, 1);
     assert.deepEqual(h.sessions.get(101)!.prompts, ["one admitted turn"]);
-    await h.bridge.handle({ update_id: currentOffset + 10, message: { from: { id: OWNER }, chat: { id: GROUP }, message_thread_id: 101, photo: [{ file_id: "unsupported" }] } });
-    await h.reply("Attachments are unsupported", 101);
+    await h.bridge.handle({ update_id: currentOffset + 10, message: { from: { id: OWNER }, chat: { id: GROUP }, message_thread_id: 101, video_note: { file_id: "unsupported" } } });
+    await h.reply("This attachment type is unsupported", 101);
     h.sessions.get(101)!.complete("completed once");
     await h.reply("completed once", 101);
     await h.bridge.stop();
     const state = JSON.parse(await readFile(join(directory, "state.json"), "utf8"));
     assert.equal(state.offset, currentOffset + 11);
     assert.equal(state.admissions.length, 0);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace archives supported attachments and recovers files from replied-to messages", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-attachments-"));
+  const h = new Harness(join(directory, "state.json"));
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create("Files");
+    await h.bridge.handle(h.incoming({
+      caption: "Review this file",
+      document: { file_id: "new-file", file_name: "notes.txt", mime_type: "text/plain" },
+    }, threadId));
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    const first = h.sessions.get(threadId)!.prompts[0]!;
+    assert.match(first, /^Review this file\n\n\[attachments\] /);
+    assert.match(first, /\/notes\.txt\n\n\[chat-attachments\] /);
+    assert.equal(h.downloads[0]!.fileId, "new-file");
+    assert.match(h.downloads[0]!.directory, new RegExp(`/attachments/${GROUP}/${threadId}/\\d+$`));
+    await h.bridge.handle(h.incoming({
+      text: "Inspect the older upload",
+      reply_to_message: {
+        message_id: 77,
+        caption: "Earlier report",
+        document: { file_id: "old-file", file_name: "report.pdf", mime_type: "application/pdf" },
+      },
+    }, threadId));
+    await h.reply("Steering applied", threadId);
+    const recovered = h.sessions.get(threadId)!.steers[0]!;
+    assert.match(recovered, /^Inspect the older upload\n\n\[reply\] Earlier report/);
+    assert.match(recovered, /\[attachments\] .+\/77\n- \/report\.pdf/);
+    assert.match(recovered, /\[chat-attachments\] /);
+    assert.deepEqual(h.downloads.map(({ fileId }) => fileId), ["new-file", "old-file"]);
+    assert.match(h.downloads[1]!.directory, /\/77$/);
+    h.sessions.get(threadId)!.complete("both files reviewed");
+    await h.reply("both files reviewed", threadId);
   } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });

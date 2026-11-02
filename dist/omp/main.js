@@ -6,6 +6,7 @@ import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { downloadTelegramFile } from "../lib/telegram-api.js";
 import { OmpSession } from "./rpc.js";
 import { startWorkspaceServer } from "./local.js";
 import { WorkspaceBridge } from "./workspace.js";
@@ -102,7 +103,9 @@ else {
         });
         await session.ready();
         return session;
-    });
+    }, (fileId, fileName, directory) => downloadTelegramFile(token, fileId, fileName, directory, {
+        maxFileSizeBytes: 20 * 1024 * 1024,
+    }));
     const terminals = new Map();
     let local;
     const shutdown = () => { stopping = true; polling.abort(); };

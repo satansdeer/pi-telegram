@@ -24,6 +24,7 @@ export interface SessionPort {
 }
 type Api = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 type OpenSession = (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort>;
+type DownloadFile = (fileId: string, fileName: string, directory: string) => Promise<string>;
 type Options = {
     statePath: string;
     cwd: string;
@@ -43,6 +44,7 @@ export declare class WorkspaceBridge {
     private readonly options;
     private readonly api;
     private readonly openSession;
+    private readonly downloadFile;
     private data;
     private initialized;
     private stopping;
@@ -57,7 +59,7 @@ export declare class WorkspaceBridge {
     private readonly busy;
     private readonly starts;
     private groupSetup;
-    constructor(options: Options, api: Api, openSession: OpenSession);
+    constructor(options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile);
     get offset(): number;
     /** Registration is ephemeral: no topic creation, persistence, or implicit reattachment. */
     register(port: SessionPort, onAttach: (binding: TerminalBinding) => Promise<void>): Promise<void>;
@@ -73,6 +75,9 @@ export declare class WorkspaceBridge {
     handle(update: unknown): Promise<void>;
     private admit;
     private process;
+    private attachmentArchive;
+    private attachmentFiles;
+    private attachmentPrompt;
     private command;
     private requireGroup;
     private requireBinding;
