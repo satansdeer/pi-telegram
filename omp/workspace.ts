@@ -4,7 +4,7 @@
  * Owns no polling or API transport. Topics and transcripts are never deleted or replaced.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   appendTelegramAttachmentSection,
@@ -81,6 +81,7 @@ const HELP = [
   "/running — list live terminals without creating topics",
   "/attach <full-session-id> — attach that exact live terminal to a topic",
   "/status — show this topic's session and pending UI requests",
+  "/repair — release a missing managed transcript so this topic can start a fresh OMP session",
   "/btw <question> — ask an ephemeral side question without adding it to the main chat history",
   "/abort — interrupt this topic's active turn",
   "/answer <request-id> <JSON object> — answer this topic's pending UI request",
@@ -503,7 +504,7 @@ export class WorkspaceBridge {
         } else {
           this.requireGroup(admission.target);
           const binding = this.requireBinding(admission.target);
-          const session = await this.session(binding);
+          const session = await this.session(binding, !binding.external && binding.sessionId === undefined);
           await this.assertIdentity(binding, session);
           admission.phase = "running";
           await this.save();
@@ -596,7 +597,7 @@ export class WorkspaceBridge {
       await this.reply(admission, "Workspace bound. Use /running and /attach <full-session-id> for a live terminal, /new [name] to create a chat topic, or /bind inside an existing non-General topic.");
       return;
     }
-    if (!["new", "bind", "running", "attach", "sessions", "status", "abort", "btw", "answer", "cancel"].includes(command.name)) throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
+    if (!["new", "bind", "running", "attach", "sessions", "status", "repair", "abort", "btw", "answer", "cancel"].includes(command.name)) throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
     this.requireGroup(target);
     if (command.name === "running") {
       if (command.argument) throw new Error("Usage: /running");
@@ -658,14 +659,8 @@ export class WorkspaceBridge {
       }
       const binding: Binding = { id, threadId: threadId!, name, cwd };
       this.data.bindings.push(binding);
-      this.busy.set(binding.threadId, 1);
       await this.save();
-      try {
-        await this.session(binding, true);
-        await this.reply(admission, `Chat created.\n${this.describe(binding)}`, { chatId: target.chatId, threadId: binding.threadId });
-      } finally {
-        this.busy.delete(binding.threadId);
-      }
+      await this.reply(admission, `Chat created.\n${this.describe(binding)}`, { chatId: target.chatId, threadId: binding.threadId });
       return;
     }
     if (command.name === "sessions") {
@@ -673,6 +668,38 @@ export class WorkspaceBridge {
       return;
     }
     const binding = this.requireBinding(target);
+    if (command.name === "repair") {
+      if (command.argument) throw new Error("Usage: /repair");
+      if (binding.external) throw new Error("Terminal-owned topics must be repaired by reopening and attaching their designated OMP session");
+      if (!binding.sessionFile) {
+        await this.reply(admission, "No transcript is designated. Send your message again to initialize this topic.");
+        return;
+      }
+      try {
+        if ((await stat(binding.sessionFile)).isFile()) throw new Error("The designated transcript still exists; repair refused to preserve its history");
+        throw new Error("The designated transcript path is not a regular file; inspect it manually");
+      } catch (error) {
+        if (!(record(error) && error.code === "ENOENT")) throw error;
+      }
+      const alternatives = (await readdir(dirname(binding.sessionFile), { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"));
+      if (alternatives.length) throw new Error("Other transcripts exist in this topic's session directory; inspect them manually before repair");
+      const existing = this.sessions.get(binding.id);
+      if (existing) {
+        try {
+          await existing;
+          throw new Error("This topic still has a live OMP process; repair refused");
+        } catch (error) {
+          if (this.sessions.get(binding.id) === existing && record(error) && error.code === "ENOENT") this.sessions.delete(binding.id);
+          else throw error;
+        }
+      }
+      delete binding.sessionId;
+      delete binding.sessionFile;
+      await this.save();
+      await this.reply(admission, "Missing transcript released. Send your message again to start a fresh OMP session; this topic and its attachment archive are unchanged.");
+      return;
+    }
     if (command.name === "btw") {
       if (!command.argument) throw new Error("Usage: /btw <question>");
       const session = await this.session(binding);
@@ -736,7 +763,7 @@ export class WorkspaceBridge {
     return binding;
   }
   private describe(binding: Binding): string {
-    return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (automatic replacement refused)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}${binding.external ? `\nTerminal: ${this.sessions.has(binding.id) ? "connected" : "offline — reopen the designated terminal, use /running and /attach <full-session-id>, or /telegram-connect there"}` : ""}`;
+    return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (created on first message)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}${binding.external ? `\nTerminal: ${this.sessions.has(binding.id) ? "connected" : "offline — reopen the designated terminal, use /running and /attach <full-session-id>, or /telegram-connect there"}` : ""}`;
   }
   private topicLocation(binding: Binding): string {
     const group = String(this.data.groupId);
@@ -761,7 +788,7 @@ export class WorkspaceBridge {
     if (existing) return existing;
     if (this.stopping) throw new Error("Workspace is stopping");
     if (binding.external) throw new Error("Designated terminal is offline. Reopen that same session, use /running and /attach <full-session-id>, or /telegram-connect there; automatic spawn/resume is forbidden");
-    if (!create && (!binding.sessionId || !binding.sessionFile)) throw new Error("Session initialization was interrupted; no designated transcript was recorded. Automatic replacement is refused");
+    if (!create && (!binding.sessionId || !binding.sessionFile)) throw new Error("This topic has no designated transcript; send a normal message to initialize it");
     const opening = (async () => {
       const port = await this.openSession({ ...binding }, (request) => this.onUi(binding, request));
       try {

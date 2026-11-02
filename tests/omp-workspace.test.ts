@@ -211,11 +211,11 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     assert.notEqual(alpha, beta);
     assert.equal([...String(h.created[1]!.name)].length, 128, "topic title stays within Telegram's codepoint limit");
     assert.match(String(h.created[0]!.name), /^\[[a-f0-9]{12}\] Alpha$/);
-    assert.notEqual(h.opened[0]!.id, h.opened[1]!.id);
-    assert.notEqual(h.opened[0]!.id, String(alpha));
     await h.dispatch("alpha input", alpha);
     await h.dispatch("beta input", beta);
     await h.until(() => h.sessions.get(alpha)!.prompts.length === 1 && h.sessions.get(beta)!.prompts.length === 1);
+    assert.notEqual(h.opened[0]!.id, h.opened[1]!.id);
+    assert.notEqual(h.opened[0]!.id, String(alpha));
     await h.dispatch("change direction", alpha);
     await h.reply("Steering applied", alpha);
     assert.deepEqual(h.sessions.get(alpha)!.steers, ["change direction"]);
@@ -276,6 +276,57 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
   }
 });
 
+test("Workspace repairs a missing managed transcript without replacing existing history or attachments", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-repair-"));
+  const statePath = join(directory, "state.json");
+  const sessionDirectory = join(directory, "sessions", "abcdef123456");
+  const transcript = join(sessionDirectory, "missing.jsonl");
+  const attachment = join(directory, "attachments", String(GROUP), "53", "91", "leads.csv");
+  await mkdir(sessionDirectory, { recursive: true });
+  await mkdir(join(directory, "attachments", String(GROUP), "53", "91"), { recursive: true });
+  await writeFile(transcript, "existing history");
+  await writeFile(attachment, "lead");
+  await writeFile(statePath, JSON.stringify({
+    version: 1,
+    ownerId: OWNER,
+    botId: BOT,
+    offset: 0,
+    groupId: GROUP,
+    bindings: [{
+      id: "abcdef123456",
+      threadId: 53,
+      name: "getsales-setup",
+      cwd: "/workspace",
+      sessionId: "missing-session",
+      sessionFile: transcript,
+    }],
+    admissions: [],
+  }));
+  const h = new Harness(statePath);
+  try {
+    await h.bridge.init();
+    await h.dispatch("/repair", 53);
+    await h.reply("transcript still exists; repair refused", 53);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId, "missing-session");
+
+    await rm(transcript);
+    await h.dispatch("/repair", 53);
+    await h.reply("Missing transcript released", 53);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId, undefined);
+    assert.equal(await readFile(attachment, "utf8"), "lead");
+
+    await h.dispatch("configure GetSales", 53);
+    await h.until(() => h.sessions.get(53)?.prompts.length === 1);
+    assert.equal(h.opened[0]?.sessionFile, undefined, "first use creates a session instead of resuming the missing transcript");
+    h.sessions.get(53)!.complete("ready");
+    await h.reply("ready", 53);
+    assert.ok(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Workspace refreshes exact-topic typing only while the model is working", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const directory = await mkdtemp(join(tmpdir(), "omp-workspace-typing-"));
@@ -325,7 +376,7 @@ test("Workspace rejects unauthorized/unbound input, ignores other bot commands, 
     await h.reply("Owner only", 101);
     await h.bridge.handle(unauthorized);
     assert.equal(h.sent.filter((sent) => sent.message_thread_id === 101 && sent.text.includes("Owner only")).length, 1);
-    assert.deepEqual(h.sessions.get(101)!.prompts, []);
+    assert.equal(h.sessions.has(101), false);
     const prompt = h.update("one admitted turn", 101);
     await h.bridge.handle(prompt);
     await h.until(() => h.sessions.get(101)!.prompts.length === 1);
@@ -510,6 +561,10 @@ test("Workspace shutdown retains an explicit failure when a designated child may
   try {
     await h.bindWorkspace();
     const thread = await h.create();
+    await h.dispatch("initialize", thread);
+    await h.until(() => h.sessions.get(thread)?.prompts.length === 1);
+    h.sessions.get(thread)!.complete("ready");
+    await h.reply("ready", thread);
     h.sessions.get(thread)!.stop = async () => { throw new Error("child still draining"); };
     await assert.rejects(h.bridge.stop(), (error: unknown) => error instanceof AggregateError
       && /ownership must be retained/.test(error.message)
@@ -630,6 +685,8 @@ test("Terminal attachment cannot take over a daemon-owned transcript", { timeout
   try {
     await h.bindWorkspace();
     const thread = await h.create();
+    await h.dispatch("initialize", thread);
+    await h.until(() => h.sessions.get(thread)?.prompts.length === 1);
     const owned = h.sessions.get(thread)!;
     const port: SessionPort = {
       async state() { return { ...await owned.state(), cwd: "/workspace" }; },
@@ -646,8 +703,6 @@ test("Terminal attachment cannot take over a daemon-owned transcript", { timeout
       await assert.rejects(h.bridge.register(conflict, async () => {}), /different session owner/);
     }
     assert.equal(h.created.length, 1);
-    await h.dispatch("owned input", thread);
-    await h.until(() => owned.prompts.length === 1);
     owned.complete("owned response");
     await h.reply("owned response", thread);
   } finally {
