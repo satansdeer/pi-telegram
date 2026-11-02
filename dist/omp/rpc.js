@@ -206,10 +206,7 @@ export class OmpSession {
             throw new Error("OMP session is stopping");
         if (!this.turn)
             throw new Error("OMP has no active prompt to steer; send this again as a new prompt");
-        const response = await this.request("steer", { message: text });
-        const disposition = record(response.data) ? response.data.disposition : undefined;
-        if (disposition !== "handled" && disposition !== "queued")
-            throw new Error("OMP returned an invalid steering response");
+        await this.request("steer", { message: text });
     }
     async btw(question) {
         if (this.sidecar)

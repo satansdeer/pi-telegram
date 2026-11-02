@@ -68,7 +68,7 @@ input.on("line", line => {
     btw = undefined;
   } else if (frame.type === "steer") {
     steering.push(frame.message);
-    reply(frame, {disposition: "queued"});
+    reply(frame);
   } else if (frame.type === "extension_ui_response" && active) {
     if (frame.cancelled) finish(null, "aborted");
     else finish("final:" + active.message + (steering.length ? "|steer:" + steering.join(",") : ""));
