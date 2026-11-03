@@ -5,7 +5,7 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   appendTelegramAttachmentSection,
   buildTelegramReplyContextBlock,
@@ -15,6 +15,7 @@ import {
 import type { DownloadedTelegramMessageFile, TelegramAttachmentSource, TelegramMediaMessage } from "../lib/media.ts";
 import { getTelegramTargetThreadParams } from "../lib/target.ts";
 import type { TelegramTarget } from "../lib/target.ts";
+import { SessionLifecycleError } from "./rpc.ts";
 
 export interface Binding {
   id: string;
@@ -41,7 +42,13 @@ export interface SessionPort {
   stop(): Promise<void>;
 }
 type Api = (method: string, params: Record<string, unknown>) => Promise<unknown>;
+type SendFile = (
+  method: string, fields: Record<string, string>, fileField: string, filePath: string, fileName: string,
+) => Promise<unknown>;
 const TYPING_REFRESH_MS = 3_000;
+const MAX_LOCAL_ARTIFACTS = 10;
+const MAX_LOCAL_ARTIFACT_BYTES = 50 * 1024 * 1024;
+const LOCAL_ARTIFACT_URI = /\blocal:\/\/([^\s<>"')\]]+)/g;
 type OpenSession = (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort>;
 type DownloadFile = (fileId: string, fileName: string, directory: string) => Promise<string>;
 type Options = { statePath: string; cwd: string; ownerId: number; botId: number; botUsername: string };
@@ -214,6 +221,7 @@ export class WorkspaceBridge {
   private readonly api: Api;
   private readonly openSession: OpenSession;
   private readonly downloadFile: DownloadFile;
+  private readonly sendFile: SendFile;
   private data: State;
   private initialized = false;
   private stopping = false;
@@ -229,12 +237,13 @@ export class WorkspaceBridge {
   private readonly starts = new Map<number, Promise<void>>();
   private groupSetup = false;
 
-  constructor(options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile) {
+  constructor(options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile, sendFile: SendFile) {
     if (!integer(options.ownerId) || !integer(options.botId) || !/^[A-Za-z0-9_]+$/.test(options.botUsername)) throw new Error("Invalid Workspace bot/owner identity");
     this.options = { ...options, statePath: resolve(options.statePath), cwd: resolve(options.cwd) };
     this.api = api;
     this.openSession = openSession;
     this.downloadFile = downloadFile;
+    this.sendFile = sendFile;
     this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
   }
   get offset(): number { return this.data.offset; }
@@ -518,7 +527,7 @@ export class WorkspaceBridge {
           } finally {
             stopTyping();
           }
-          await this.reply(admission, output || "OMP completed without a text reply.");
+          await this.replyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");
         }
       }
       await this.complete(admission);
@@ -690,7 +699,8 @@ export class WorkspaceBridge {
           await existing;
           throw new Error("This topic still has a live OMP process; repair refused");
         } catch (error) {
-          if (this.sessions.get(binding.id) === existing && record(error) && error.code === "ENOENT") this.sessions.delete(binding.id);
+          const failure = error instanceof SessionLifecycleError && error.shutdownConfirmed ? error.cause : error;
+          if (this.sessions.get(binding.id) === existing && record(failure) && failure.code === "ENOENT") this.sessions.delete(binding.id);
           else throw error;
         }
       }
@@ -816,8 +826,11 @@ export class WorkspaceBridge {
         return port;
       } catch (error) {
         try { await port.stop(); }
-        catch (shutdown) { throw new AggregateError([error, shutdown], "OMP initialization failed and child shutdown is uncertain"); }
-        throw error;
+        catch (shutdown) {
+          if (shutdown instanceof SessionLifecycleError && shutdown.shutdownConfirmed) throw new SessionLifecycleError(error, true);
+          throw new SessionLifecycleError(new AggregateError([error, shutdown], "OMP initialization failed and child shutdown is uncertain"), false);
+        }
+        throw new SessionLifecycleError(error, true);
       }
     })();
     this.sessions.set(binding.id, opening);
@@ -871,6 +884,52 @@ export class WorkspaceBridge {
       stopped = true;
       clearInterval(timer);
     };
+  }
+
+  private async localArtifacts(binding: Binding, body: string): Promise<string[]> {
+    if (!binding.sessionFile || !body.includes("local://")) return [];
+    let root: string;
+    try {
+      root = await realpath(join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local"));
+    } catch (error) {
+      if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) return [];
+      throw error;
+    }
+    const files: string[] = [];
+    const seen = new Set<string>();
+    for (const match of body.matchAll(LOCAL_ARTIFACT_URI)) {
+      let artifactName: string;
+      try { artifactName = decodeURIComponent(match[1]!); }
+      catch { continue; }
+      if (!artifactName || artifactName.includes("\0") || isAbsolute(artifactName)) continue;
+      let file: string;
+      try { file = await realpath(resolve(root, artifactName)); }
+      catch (error) {
+        if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) continue;
+        throw error;
+      }
+      const contained = relative(root, file);
+      if (!contained || contained === ".." || contained.startsWith(`..${sep}`) || isAbsolute(contained) || seen.has(file)) continue;
+      const info = await stat(file);
+      if (!info.isFile()) continue;
+      if (info.size > MAX_LOCAL_ARTIFACT_BYTES) {
+        throw new Error(`${basename(file)} exceeds the ${MAX_LOCAL_ARTIFACT_BYTES}-byte Telegram file limit`);
+      }
+      if (files.length === MAX_LOCAL_ARTIFACTS) throw new Error(`OMP reply contains more than ${MAX_LOCAL_ARTIFACTS} local files`);
+      seen.add(file);
+      files.push(file);
+    }
+    return files;
+  }
+  private async replyWithArtifacts(admission: Admission, binding: Binding, body: string): Promise<void> {
+    const files = await this.localArtifacts(binding, body);
+    await this.reply(admission, body);
+    for (const file of files) {
+      await this.sendFile("sendDocument", {
+        chat_id: String(admission.target.chatId),
+        ...(admission.target.threadId === undefined ? {} : { message_thread_id: String(admission.target.threadId) }),
+      }, "document", file, basename(file));
+    }
   }
 
   private async reply(admission: Admission, body: string, target = admission.target): Promise<void> {
@@ -942,7 +1001,10 @@ export class WorkspaceBridge {
     for (const port of this.terminals.keys()) this.detach(port);
     const opened = await Promise.allSettled([...this.sessions.values()]);
     const shutdowns = await Promise.allSettled(opened.flatMap((result) => result.status === "fulfilled" ? [result.value.stop()] : []));
-    const failures = [...opened, ...shutdowns].filter((result) => result.status === "rejected").map((result) => result.reason);
+    // Failed operations are not live-child proof; ignore only explicitly confirmed startup cleanup.
+    const failures = [...opened.filter((result) => result.status === "rejected"
+      && !(result.reason instanceof SessionLifecycleError && result.reason.shutdownConfirmed)), ...shutdowns]
+      .filter((result) => result.status === "rejected").map((result) => result.reason);
     if (failures.length) throw new AggregateError(failures, "OMP child shutdown is uncertain; supervisor ownership must be retained");
     await this.writing;
   }

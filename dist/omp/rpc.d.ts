@@ -3,6 +3,11 @@ export type UiRequest = {
     method: string;
     [key: string]: unknown;
 };
+/** Carries child-ownership proof without treating a failed operation as success. */
+export declare class SessionLifecycleError extends Error {
+    readonly shutdownConfirmed: boolean;
+    constructor(cause: unknown, shutdownConfirmed: boolean);
+}
 export declare class OmpSession {
     private readonly child;
     private readonly pending;

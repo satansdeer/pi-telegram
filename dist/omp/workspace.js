@@ -4,11 +4,15 @@
  * Owns no polling or API transport. Topics and transcripts are never deleted or replaced.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { appendTelegramAttachmentSection, buildTelegramReplyContextBlock, downloadTelegramMessageFiles, extractTelegramMessageText, } from "../lib/media.js";
 import { getTelegramTargetThreadParams } from "../lib/target.js";
+import { SessionLifecycleError } from "./rpc.js";
 const TYPING_REFRESH_MS = 3_000;
+const MAX_LOCAL_ARTIFACTS = 10;
+const MAX_LOCAL_ARTIFACT_BYTES = 50 * 1024 * 1024;
+const LOCAL_ARTIFACT_URI = /\blocal:\/\/([^\s<>"')\]]+)/g;
 const HELP = [
     "/workspace — bind this forum supergroup once (bot must manage topics)",
     "/new [name] [--cwd directory] — create a topic/session; relative directories start at the Workspace root",
@@ -17,6 +21,7 @@ const HELP = [
     "/running — list live terminals without creating topics",
     "/attach <full-session-id> — attach that exact live terminal to a topic",
     "/status — show this topic's session and pending UI requests",
+    "/repair — release a missing managed transcript so this topic can start a fresh OMP session",
     "/btw <question> — ask an ephemeral side question without adding it to the main chat history",
     "/abort — interrupt this topic's active turn",
     "/answer <request-id> <JSON object> — answer this topic's pending UI request",
@@ -173,6 +178,7 @@ export class WorkspaceBridge {
     api;
     openSession;
     downloadFile;
+    sendFile;
     data;
     initialized = false;
     stopping = false;
@@ -187,13 +193,14 @@ export class WorkspaceBridge {
     busy = new Map();
     starts = new Map();
     groupSetup = false;
-    constructor(options, api, openSession, downloadFile) {
+    constructor(options, api, openSession, downloadFile, sendFile) {
         if (!integer(options.ownerId) || !integer(options.botId) || !/^[A-Za-z0-9_]+$/.test(options.botUsername))
             throw new Error("Invalid Workspace bot/owner identity");
         this.options = { ...options, statePath: resolve(options.statePath), cwd: resolve(options.cwd) };
         this.api = api;
         this.openSession = openSession;
         this.downloadFile = downloadFile;
+        this.sendFile = sendFile;
         this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
     }
     get offset() { return this.data.offset; }
@@ -511,7 +518,7 @@ export class WorkspaceBridge {
                 else {
                     this.requireGroup(admission.target);
                     const binding = this.requireBinding(admission.target);
-                    const session = await this.session(binding);
+                    const session = await this.session(binding, !binding.external && binding.sessionId === undefined);
                     await this.assertIdentity(binding, session);
                     admission.phase = "running";
                     await this.save();
@@ -527,7 +534,7 @@ export class WorkspaceBridge {
                     finally {
                         stopTyping();
                     }
-                    await this.reply(admission, output || "OMP completed without a text reply.");
+                    await this.replyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");
                 }
             }
             await this.complete(admission);
@@ -615,7 +622,7 @@ export class WorkspaceBridge {
             await this.reply(admission, "Workspace bound. Use /running and /attach <full-session-id> for a live terminal, /new [name] to create a chat topic, or /bind inside an existing non-General topic.");
             return;
         }
-        if (!["new", "bind", "running", "attach", "sessions", "status", "abort", "btw", "answer", "cancel"].includes(command.name))
+        if (!["new", "bind", "running", "attach", "sessions", "status", "repair", "abort", "btw", "answer", "cancel"].includes(command.name))
             throw new Error("Unsupported slash command. Use /help; slash commands are never forwarded to OMP");
         this.requireGroup(target);
         if (command.name === "running") {
@@ -699,15 +706,8 @@ export class WorkspaceBridge {
             }
             const binding = { id, threadId: threadId, name, cwd };
             this.data.bindings.push(binding);
-            this.busy.set(binding.threadId, 1);
             await this.save();
-            try {
-                await this.session(binding, true);
-                await this.reply(admission, `Chat created.\n${this.describe(binding)}`, { chatId: target.chatId, threadId: binding.threadId });
-            }
-            finally {
-                this.busy.delete(binding.threadId);
-            }
+            await this.reply(admission, `Chat created.\n${this.describe(binding)}`, { chatId: target.chatId, threadId: binding.threadId });
             return;
         }
         if (command.name === "sessions") {
@@ -715,6 +715,48 @@ export class WorkspaceBridge {
             return;
         }
         const binding = this.requireBinding(target);
+        if (command.name === "repair") {
+            if (command.argument)
+                throw new Error("Usage: /repair");
+            if (binding.external)
+                throw new Error("Terminal-owned topics must be repaired by reopening and attaching their designated OMP session");
+            if (!binding.sessionFile) {
+                await this.reply(admission, "No transcript is designated. Send your message again to initialize this topic.");
+                return;
+            }
+            try {
+                if ((await stat(binding.sessionFile)).isFile())
+                    throw new Error("The designated transcript still exists; repair refused to preserve its history");
+                throw new Error("The designated transcript path is not a regular file; inspect it manually");
+            }
+            catch (error) {
+                if (!(record(error) && error.code === "ENOENT"))
+                    throw error;
+            }
+            const alternatives = (await readdir(dirname(binding.sessionFile), { withFileTypes: true }))
+                .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"));
+            if (alternatives.length)
+                throw new Error("Other transcripts exist in this topic's session directory; inspect them manually before repair");
+            const existing = this.sessions.get(binding.id);
+            if (existing) {
+                try {
+                    await existing;
+                    throw new Error("This topic still has a live OMP process; repair refused");
+                }
+                catch (error) {
+                    const failure = error instanceof SessionLifecycleError && error.shutdownConfirmed ? error.cause : error;
+                    if (this.sessions.get(binding.id) === existing && record(failure) && failure.code === "ENOENT")
+                        this.sessions.delete(binding.id);
+                    else
+                        throw error;
+                }
+            }
+            delete binding.sessionId;
+            delete binding.sessionFile;
+            await this.save();
+            await this.reply(admission, "Missing transcript released. Send your message again to start a fresh OMP session; this topic and its attachment archive are unchanged.");
+            return;
+        }
         if (command.name === "btw") {
             if (!command.argument)
                 throw new Error("Usage: /btw <question>");
@@ -794,7 +836,7 @@ export class WorkspaceBridge {
         return binding;
     }
     describe(binding) {
-        return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (automatic replacement refused)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}${binding.external ? `\nTerminal: ${this.sessions.has(binding.id) ? "connected" : "offline — reopen the designated terminal, use /running and /attach <full-session-id>, or /telegram-connect there"}` : ""}`;
+        return `Chat ${binding.id}: ${binding.name}\nTelegram topic: ${binding.threadId}\nOMP session: ${binding.sessionId ?? "uninitialized (created on first message)"}\nTranscript: ${binding.sessionFile ?? "not recorded"}\nCwd: ${binding.cwd}${binding.external ? `\nTerminal: ${this.sessions.has(binding.id) ? "connected" : "offline — reopen the designated terminal, use /running and /attach <full-session-id>, or /telegram-connect there"}` : ""}`;
     }
     topicLocation(binding) {
         const group = String(this.data.groupId);
@@ -825,7 +867,7 @@ export class WorkspaceBridge {
         if (binding.external)
             throw new Error("Designated terminal is offline. Reopen that same session, use /running and /attach <full-session-id>, or /telegram-connect there; automatic spawn/resume is forbidden");
         if (!create && (!binding.sessionId || !binding.sessionFile))
-            throw new Error("Session initialization was interrupted; no designated transcript was recorded. Automatic replacement is refused");
+            throw new Error("This topic has no designated transcript; send a normal message to initialize it");
         const opening = (async () => {
             const port = await this.openSession({ ...binding }, (request) => this.onUi(binding, request));
             try {
@@ -860,9 +902,11 @@ export class WorkspaceBridge {
                     await port.stop();
                 }
                 catch (shutdown) {
-                    throw new AggregateError([error, shutdown], "OMP initialization failed and child shutdown is uncertain");
+                    if (shutdown instanceof SessionLifecycleError && shutdown.shutdownConfirmed)
+                        throw new SessionLifecycleError(error, true);
+                    throw new SessionLifecycleError(new AggregateError([error, shutdown], "OMP initialization failed and child shutdown is uncertain"), false);
                 }
-                throw error;
+                throw new SessionLifecycleError(error, true);
             }
         })();
         this.sessions.set(binding.id, opening);
@@ -925,6 +969,65 @@ export class WorkspaceBridge {
             stopped = true;
             clearInterval(timer);
         };
+    }
+    async localArtifacts(binding, body) {
+        if (!binding.sessionFile || !body.includes("local://"))
+            return [];
+        let root;
+        try {
+            root = await realpath(join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local"));
+        }
+        catch (error) {
+            if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+                return [];
+            throw error;
+        }
+        const files = [];
+        const seen = new Set();
+        for (const match of body.matchAll(LOCAL_ARTIFACT_URI)) {
+            let artifactName;
+            try {
+                artifactName = decodeURIComponent(match[1]);
+            }
+            catch {
+                continue;
+            }
+            if (!artifactName || artifactName.includes("\0") || isAbsolute(artifactName))
+                continue;
+            let file;
+            try {
+                file = await realpath(resolve(root, artifactName));
+            }
+            catch (error) {
+                if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+                    continue;
+                throw error;
+            }
+            const contained = relative(root, file);
+            if (!contained || contained === ".." || contained.startsWith(`..${sep}`) || isAbsolute(contained) || seen.has(file))
+                continue;
+            const info = await stat(file);
+            if (!info.isFile())
+                continue;
+            if (info.size > MAX_LOCAL_ARTIFACT_BYTES) {
+                throw new Error(`${basename(file)} exceeds the ${MAX_LOCAL_ARTIFACT_BYTES}-byte Telegram file limit`);
+            }
+            if (files.length === MAX_LOCAL_ARTIFACTS)
+                throw new Error(`OMP reply contains more than ${MAX_LOCAL_ARTIFACTS} local files`);
+            seen.add(file);
+            files.push(file);
+        }
+        return files;
+    }
+    async replyWithArtifacts(admission, binding, body) {
+        const files = await this.localArtifacts(binding, body);
+        await this.reply(admission, body);
+        for (const file of files) {
+            await this.sendFile("sendDocument", {
+                chat_id: String(admission.target.chatId),
+                ...(admission.target.threadId === undefined ? {} : { message_thread_id: String(admission.target.threadId) }),
+            }, "document", file, basename(file));
+        }
     }
     async reply(admission, body, target = admission.target) {
         admission.phase = "delivery";
@@ -1011,7 +1114,10 @@ export class WorkspaceBridge {
             this.detach(port);
         const opened = await Promise.allSettled([...this.sessions.values()]);
         const shutdowns = await Promise.allSettled(opened.flatMap((result) => result.status === "fulfilled" ? [result.value.stop()] : []));
-        const failures = [...opened, ...shutdowns].filter((result) => result.status === "rejected").map((result) => result.reason);
+        // Failed operations are not live-child proof; ignore only explicitly confirmed startup cleanup.
+        const failures = [...opened.filter((result) => result.status === "rejected"
+                && !(result.reason instanceof SessionLifecycleError && result.reason.shutdownConfirmed)), ...shutdowns]
+            .filter((result) => result.status === "rejected").map((result) => result.reason);
         if (failures.length)
             throw new AggregateError(failures, "OMP child shutdown is uncertain; supervisor ownership must be retained");
         await this.writing;

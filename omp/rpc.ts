@@ -34,6 +34,16 @@ type Exit = { code: number | null; signal: NodeJS.Signals | null; error?: Error 
 
 class OutcomeUnknownError extends Error {}
 
+/** Carries child-ownership proof without treating a failed operation as success. */
+export class SessionLifecycleError extends Error {
+  readonly shutdownConfirmed: boolean;
+
+  constructor(cause: unknown, shutdownConfirmed: boolean) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.shutdownConfirmed = shutdownConfirmed;
+  }
+}
+
 function record(value: unknown): value is Frame {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -95,32 +105,36 @@ export class OmpSession {
     binary: string; cwd: string; sessionDir: string; resume?: string;
     onUi: (request: UiRequest) => void; args?: string[];
   }) {
-    const directory = resolve(options.cwd, options.sessionDir);
-    this.directory = directory;
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    chmodSync(directory, 0o700);
-    this.recovered = new Map();
-    const resume = options.resume === undefined ? undefined : resolve(options.cwd, options.resume);
-    if (resume !== undefined) {
-      this.recovered.set(resume, transcriptId(resume));
-    } else {
-      for (const entry of readdirSync(directory, { withFileTypes: true })) {
-        if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-          const file = resolve(directory, entry.name);
-          this.recovered.set(file, transcriptId(file));
+    try {
+      const directory = resolve(options.cwd, options.sessionDir);
+      this.directory = directory;
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o700);
+      this.recovered = new Map();
+      const resume = options.resume === undefined ? undefined : resolve(options.cwd, options.resume);
+      if (resume !== undefined) {
+        this.recovered.set(resume, transcriptId(resume));
+      } else {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+          if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+            const file = resolve(directory, entry.name);
+            this.recovered.set(file, transcriptId(file));
+          }
         }
       }
+      const env = { ...process.env };
+      for (const [key, value] of Object.entries(env)) {
+        if (/TELEGRAM.*TOKEN|BOT_?TOKEN|TOKEN.*TELEGRAM/i.test(key) || /^\d+:[\w-]{20,}$/.test(value ?? "")) delete env[key];
+      }
+      env.OMP_WORKSPACE_MANAGED = "1";
+      this.onUi = options.onUi;
+      this.child = spawn(options.binary, [
+        ...(options.args ?? []), "--mode", "rpc", "--session-dir", directory,
+        ...(resume ? ["--resume", resume] : this.recovered.size ? ["--continue"] : []),
+      ], { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      throw new SessionLifecycleError(error, true);
     }
-    const env = { ...process.env };
-    for (const [key, value] of Object.entries(env)) {
-      if (/TELEGRAM.*TOKEN|BOT_?TOKEN|TOKEN.*TELEGRAM/i.test(key) || /^\d+:[\w-]{20,}$/.test(value ?? "")) delete env[key];
-    }
-    env.OMP_WORKSPACE_MANAGED = "1";
-    this.onUi = options.onUi;
-    this.child = spawn(options.binary, [
-      ...(options.args ?? []), "--mode", "rpc", "--session-dir", directory,
-      ...(resume ? ["--resume", resume] : this.recovered.size ? ["--continue"] : []),
-    ], { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     const exited = Promise.withResolvers<Exit>();
     this.exited = exited.promise;
     this.child.once("error", (error) => this.fail(error));
@@ -168,10 +182,10 @@ export class OmpSession {
       return state;
     } catch (error) {
       try { await this.stop(); } catch (shutdown) {
-        if (this.exit) throw error; // A known exit is not an orphaned startup process.
-        throw new AggregateError([error, shutdown], "OMP startup failed and its child shutdown is uncertain");
+        if (this.exit) throw new SessionLifecycleError(error, true);
+        throw new SessionLifecycleError(new AggregateError([error, shutdown], "OMP startup failed and its child shutdown is uncertain"), false);
       }
-      throw error;
+      throw new SessionLifecycleError(error, true);
     }
   }
 
@@ -250,8 +264,8 @@ export class OmpSession {
     this.stopping = true;
     if (!this.exit) this.child.stdin.end();
     const result = await deadline(this.exited, 5_000, "OMP is still draining accepted work; shutdown outcome unknown (child was not killed)");
-    if (result.error) throw result.error;
-    if (result.code !== 0) throw new Error(`OMP shutdown failed (${result.signal ?? result.code}); persistence outcome unknown`);
+    if (result.error) throw new SessionLifecycleError(result.error, true);
+    if (result.code !== 0) throw new SessionLifecycleError(new Error(`OMP shutdown failed (${result.signal ?? result.code}); persistence outcome unknown`), true);
   }
 
   private async request(type: string, fields: Frame = {}, id = `workspace-${++this.sequence}`): Promise<Frame> {

@@ -10,12 +10,20 @@ import { scheduler } from "node:timers/promises";
 import { test } from "node:test";
 import { WorkspaceBridge } from "../omp/workspace.ts";
 import type { Binding, SessionPort, UiRequest } from "../omp/workspace.ts";
+import { OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
 
 const OWNER = 42;
 const BOT = 99;
 const GROUP = -100123;
 type Sent = { chat_id: number; message_thread_id?: number; text: string; parse_mode?: "HTML" };
 type Action = { chat_id: number; message_thread_id?: number; action: "typing" };
+type Upload = {
+  method: string;
+  fields: Record<string, string>;
+  fileField: string;
+  filePath: string;
+  fileName: string;
+};
 
 class FakeSession implements SessionPort {
   readonly binding: Binding;
@@ -109,11 +117,13 @@ class Harness {
   readonly ui = new Map<number, (request: UiRequest) => void>();
   readonly created: Array<Record<string, unknown>> = [];
   readonly downloads: Array<{ fileId: string; fileName: string; directory: string; path: string }> = [];
+  readonly uploads: Upload[] = [];
   private readonly listeners = new Set<() => void>();
   private updateId: number;
   private nextThread = 100;
   failSend?: (message: Sent) => boolean;
   beforeCreateTopic?: () => Promise<void>;
+  openSession?: (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort | undefined>;
   constructor(statePath: string, offset = 0, cwd = "/workspace") {
     this.updateId = offset;
     this.bridge = new WorkspaceBridge({ statePath, cwd, ownerId: OWNER, botId: BOT, botUsername: "workspace_bot" }, async (method, params) => {
@@ -138,6 +148,8 @@ class Harness {
     }, async (binding, onUi) => {
       this.opened.push({ ...binding });
       this.ui.set(binding.threadId, onUi);
+      const opened = await this.openSession?.(binding, onUi);
+      if (opened) return opened;
       const session = new FakeSession(binding, () => { for (const listener of this.listeners) listener(); });
       this.sessions.set(binding.threadId, session);
       return session;
@@ -145,8 +157,13 @@ class Harness {
       const path = join(directory, fileName);
       this.downloads.push({ fileId, fileName, directory, path });
       return path;
+    }, async (method, fields, fileField, filePath, fileName) => {
+      this.uploads.push({ method, fields, fileField, filePath, fileName });
+      for (const listener of this.listeners) listener();
+      return { message_id: this.uploads.length };
     });
   }
+  notify(): void { for (const listener of this.listeners) listener(); }
   incoming(fields: Record<string, unknown>, threadId?: number, ownerId = OWNER, groupId = GROUP): Record<string, unknown> {
     const updateId = this.updateId++;
     return {
@@ -310,6 +327,13 @@ test("Workspace repairs a missing managed transcript without replacing existing 
     assert.equal(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId, "missing-session");
 
     await rm(transcript);
+    h.openSession = async () => {
+      try { await readFile(transcript); }
+      catch (error) { throw new SessionLifecycleError(error, true); }
+      return undefined;
+    };
+    await h.command("request before repair", "ENOENT", 53);
+    h.openSession = undefined;
     await h.dispatch("/repair", 53);
     await h.reply("Missing transcript released", 53);
     assert.equal(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId, undefined);
@@ -317,7 +341,7 @@ test("Workspace repairs a missing managed transcript without replacing existing 
 
     await h.dispatch("configure GetSales", 53);
     await h.until(() => h.sessions.get(53)?.prompts.length === 1);
-    assert.equal(h.opened[0]?.sessionFile, undefined, "first use creates a session instead of resuming the missing transcript");
+    assert.equal(h.opened.at(-1)?.sessionFile, undefined, "first use after explicit repair creates a session instead of resuming the missing transcript");
     h.sessions.get(53)!.complete("ready");
     await h.reply("ready", 53);
     assert.ok(JSON.parse(await readFile(statePath, "utf8")).bindings[0].sessionId);
@@ -436,6 +460,49 @@ test("Workspace archives supported attachments and recovers files from replied-t
     assert.match(h.downloads[1]!.directory, /\/77$/);
     h.sessions.get(threadId)!.complete("both files reviewed");
     await h.reply("both files reviewed", threadId);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace uploads only contained regular local artifacts from an OMP reply", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-output-"));
+  const statePath = join(directory, "state.json");
+  const transcript = join(directory, "sessions", "turn.jsonl");
+  const local = join(directory, "sessions", "turn", "local");
+  const report = join(local, "reports", "mont.md");
+  const secret = join(directory, "sessions", "turn", "secret.txt");
+  await mkdir(join(local, "reports"), { recursive: true });
+  await writeFile(report, "safe report\n");
+  await writeFile(secret, "must not upload\n");
+  await symlink(secret, join(local, "leak.txt"));
+  const h = new Harness(statePath);
+  let session: FakeSession | undefined;
+  h.openSession = async (binding) => {
+    session = new FakeSession({ ...binding, sessionFile: transcript }, () => h.notify());
+    h.sessions.set(binding.threadId, session);
+    return session;
+  };
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create("Output");
+    await h.dispatch("Create the report", threadId);
+    await h.until(() => session?.prompts.length === 1);
+    session!.complete([
+      "Done: [report](local://reports%2Fmont.md)",
+      "[outside](local://../secret.txt)",
+      "[symlink](local://leak.txt)",
+    ].join("\n"));
+    await h.reply("Done:", threadId);
+    await h.until(() => h.uploads.length === 1);
+    assert.deepEqual(h.uploads, [{
+      method: "sendDocument",
+      fields: { chat_id: String(GROUP), message_thread_id: String(threadId) },
+      fileField: "document",
+      filePath: await realpath(report),
+      fileName: "mont.md",
+    }]);
   } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
@@ -575,6 +642,99 @@ test("Workspace shutdown retains an explicit failure when a designated child may
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("Workspace latches a missing designated transcript without poisoning other topics or shutdown", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-missing-"));
+  const statePath = join(directory, "state.json");
+  const binding: Binding = { id: "aaaaaaaaaaaa", threadId: 10, name: "Missing", cwd: directory,
+    sessionId: "missing-session", sessionFile: join(directory, "missing", "transcript.jsonl") };
+  await writeFile(statePath, JSON.stringify({ version: 1, ownerId: OWNER, botId: BOT, offset: 0,
+    groupId: GROUP, bindings: [binding], admissions: [] }));
+  const h = new Harness(statePath, 0, directory);
+  h.openSession = async (opening, onUi) => {
+    if (opening.id !== binding.id) return undefined;
+    const session = new OmpSession({ binary: process.execPath, cwd: opening.cwd,
+      sessionDir: join(directory, opening.id), resume: opening.sessionFile, onUi });
+    await session.ready();
+    return session;
+  };
+  try {
+    await h.bridge.init();
+    await h.command("first request", "ENOENT", binding.threadId);
+    await h.command("second request", "ENOENT", binding.threadId);
+    assert.equal(h.opened.filter((opening) => opening.id === binding.id).length, 1, "failed opening must not spawn a replacement");
+    assert.equal(h.sessions.has(binding.threadId), false);
+
+    const healthy = await h.create("Healthy");
+    await h.dispatch("still usable", healthy);
+    await h.until(() => h.sessions.get(healthy)?.prompts.length === 1);
+    h.sessions.get(healthy)!.complete("healthy reply");
+    await h.reply("healthy reply", healthy);
+    await h.bridge.stop();
+
+    const saved = JSON.parse(await readFile(statePath, "utf8"));
+    assert.deepEqual(saved.bindings.find((entry: Binding) => entry.id === binding.id), binding);
+    assert.deepEqual(saved.admissions, []);
+    assert.equal(h.sessions.get(healthy)!.stopped, true);
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const classified of [false, true]) {
+  test(`Workspace retains ${classified ? "classified" : "unclassified"} startup uncertainty without reopening`, { timeout: 15000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "omp-workspace-startup-"));
+    const h = new Harness(join(directory, "state.json"));
+    h.openSession = async () => {
+      const error = new Error("startup child shutdown is uncertain");
+      throw classified ? new SessionLifecycleError(error, false) : error;
+    };
+    try {
+      await h.bindWorkspace();
+      const thread = await h.create();
+      await h.command("first request", "startup child shutdown is uncertain", thread);
+      await h.command("second request", "startup child shutdown is uncertain", thread);
+      assert.equal(h.opened.length, 1);
+      await assert.rejects(h.bridge.stop(), /ownership must be retained/);
+    } finally {
+      await h.bridge.stop().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const cleanup of ["clean", "exited", "uncertain"] as const) {
+  test(`Workspace latches validation failure with ${cleanup} child cleanup`, { timeout: 15000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "omp-workspace-validation-"));
+    const h = new Harness(join(directory, "state.json"));
+    let stops = 0;
+    h.openSession = async (binding) => {
+      const port = new FakeSession(binding, () => {});
+      port.state = async () => ({ sessionId: "invalid", sessionFile: "relative.jsonl" });
+      port.stop = async () => {
+        stops++;
+        if (cleanup === "exited") throw new SessionLifecycleError(new Error("child exited unsuccessfully"), true);
+        if (cleanup === "uncertain") throw new Error("child still draining");
+      };
+      return port;
+    };
+    try {
+      await h.bindWorkspace();
+      const thread = await h.create();
+      const failure = cleanup === "uncertain" ? "shutdown is uncertain" : "OMP did not return";
+      await h.command("first request", failure, thread);
+      await h.command("second request", failure, thread);
+      assert.equal(h.opened.length, 1);
+      assert.equal(stops, 1, "failed opening cleanup must not be retried");
+      if (cleanup === "uncertain") await assert.rejects(h.bridge.stop(), /ownership must be retained/);
+      else await h.bridge.stop();
+    } finally {
+      await h.bridge.stop().catch(() => undefined);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
 
 test("Workspace validates project directories before creating topics and persists canonical per-chat directories", { timeout: 15000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "omp-workspace-cwd-"));

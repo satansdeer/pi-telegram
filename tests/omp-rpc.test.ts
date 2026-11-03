@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
-import { OmpSession } from "../omp/rpc.ts";
+import { OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
 import type { UiRequest } from "../omp/rpc.ts";
 
 const fixture = String.raw`
@@ -40,7 +40,7 @@ const input = createInterface({input: process.stdin, crlfDelay: Infinity});
 input.on("line", line => {
   const frame = JSON.parse(line);
   if (frame.type === "get_state") {
-    reply(frame, {sessionId: args.includes("--wrong-session") ? "wrong-session" : sessionId, sessionFile, isStreaming: !!active, continued, resume: resume ?? null,
+    reply(frame, {sessionId: args.includes("--wrong-session") ? "wrong-session" : sessionId, sessionFile, pid: process.pid, isStreaming: !!active, continued, resume: resume ?? null,
       tokenPresent: Object.keys(process.env).some(key => /TELEGRAM.*TOKEN|BOT_?TOKEN/i.test(key))});
   } else if (frame.type === "prompt") {
     if (frame.message === "exit") process.exit(7);
@@ -77,7 +77,10 @@ input.on("line", line => {
     if (active) finish(null, "aborted");
   }
 });
-input.on("close", () => { if (active) finish("drained"); });
+input.on("close", () => {
+  if (active) finish("drained");
+  if (args.includes("--failed-exit")) process.exitCode = 7;
+});
 `;
 
 test("OMP admits one turn, keeps controls responsive, and never reuses old output or hides failures", { timeout: 15_000 }, async () => {
@@ -164,14 +167,16 @@ test("OMP keeps topic transcripts isolated, recovers only existing files, and re
     assert.equal(resumedState.resume, firstState.sessionFile);
     assert.equal(resumedState.sessionId, firstState.sessionId);
     const mismatched = open("one", String(firstState.sessionFile), ["--wrong-session"]);
-    await assert.rejects(mismatched.ready(), /did not resume the persisted transcript/);
+    await assert.rejects(mismatched.ready(), (error: unknown) => error instanceof SessionLifecycleError
+      && error.shutdownConfirmed && /did not resume the persisted transcript/.test(error.message));
     await assert.rejects(mismatched.state(), /exited/, "failed startup must have closed its child");
     const other = open("two");
     const otherState = await other.ready();
     assert.notEqual(otherState.sessionId, firstState.sessionId);
     assert.notEqual(otherState.sessionFile, firstState.sessionFile);
     assert.equal(otherState.continued, false);
-    assert.throws(() => open("one", join(root, "missing.jsonl")), /ENOENT/);
+    assert.throws(() => open("one", join(root, "missing.jsonl")), (error: unknown) => error instanceof SessionLifecycleError
+      && error.shutdownConfirmed && (error.cause as NodeJS.ErrnoException).code === "ENOENT");
     await mkdir(join(root, "invalid"));
     await writeFile(join(root, "invalid", "broken.jsonl"), "not a transcript\n");
     assert.throws(() => open("invalid"), /no valid session identity/);
@@ -186,3 +191,28 @@ test("OMP keeps topic transcripts isolated, recovers only existing files, and re
     await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const cleanup of ["failed-exit", "uncertain"] as const) {
+  test(`OMP startup distinguishes confirmed ${cleanup === "failed-exit" ? "exit" : "uncertain cleanup"}`, { timeout: 15000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-rpc-startup-"));
+    const script = join(root, "fixture.mjs");
+    const resume = join(root, "designated.jsonl");
+    await writeFile(script, fixture);
+    await writeFile(resume, JSON.stringify({ type: "session", id: "designated-session" }) + "\n");
+    const session = new OmpSession({ binary: process.execPath, args: [script, "--wrong-session", ...(cleanup === "failed-exit" ? ["--failed-exit"] : [])],
+      cwd: root, sessionDir: join(root, "topic"), resume, onUi() {} });
+    const stop = session.stop.bind(session);
+    let pid: number | undefined;
+    try {
+      pid = (await session.state()).pid as number;
+      if (cleanup === "uncertain") session.stop = async () => { throw new Error("shutdown outcome unknown"); };
+      await assert.rejects(session.ready(), (error: unknown) => error instanceof SessionLifecycleError
+        && error.shutdownConfirmed === (cleanup === "failed-exit")
+        && (cleanup === "failed-exit" ? /did not resume/.test(error.message) : /child shutdown is uncertain/.test(error.message)));
+      if (cleanup === "uncertain") assert.doesNotThrow(() => process.kill(pid!, 0), "uncertain startup must not kill the child");
+    } finally {
+      await stop().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
