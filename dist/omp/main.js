@@ -2,8 +2,9 @@
  * Standalone OMP Workspace daemon: bot transport, single-process ownership, RPC wiring.
  * Zones: telegram transport, process lifecycle, configuration
  */
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, open, readFile, rm, unlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { callTelegramMultipart, downloadTelegramFile } from "../lib/telegram-api.js";
@@ -22,6 +23,39 @@ const cwd = resolve(process.env.OMP_WORKSPACE_CWD ?? process.cwd());
 const binary = process.env.OMP_BINARY || "omp";
 let stopping = false;
 const polling = new AbortController();
+function run(executable, args) {
+    return new Promise((resolveRun, rejectRun) => {
+        const child = spawn(executable, args, { stdio: "ignore", timeout: 120_000 });
+        child.once("error", rejectRun);
+        child.once("exit", (code, signal) => {
+            if (code === 0)
+                resolveRun();
+            else
+                rejectRun(new Error(`${executable} exited with ${code ?? signal}`));
+        });
+    });
+}
+async function transcribeVoice(filePath) {
+    const directory = await mkdtemp(join(tmpdir(), "omp-whisper-"));
+    try {
+        const wav = join(directory, "voice.wav");
+        const output = join(directory, "transcript");
+        await run(process.env.OMP_FFMPEG_BINARY || "/opt/homebrew/bin/ffmpeg", [
+            "-hide_banner", "-loglevel", "error", "-y", "-i", filePath, "-ar", "16000", "-ac", "1", wav,
+        ]);
+        await run(process.env.OMP_WHISPER_BINARY || "/opt/homebrew/bin/whisper-cli", [
+            "-m", resolve(process.env.OMP_WHISPER_MODEL ?? join(homedir(), ".cache", "whisper", "ggml-small.bin")),
+            "-l", "auto", "-f", wav, "-otxt", "-of", output, "-np", "-nt",
+        ]);
+        const transcript = (await readFile(`${output}.txt`, "utf8")).trim();
+        if (!transcript)
+            throw new Error("Whisper returned no speech");
+        return transcript;
+    }
+    finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
 class TelegramError extends Error {
     code;
     retryAfter;
@@ -105,7 +139,7 @@ else {
         return session;
     }, (fileId, fileName, directory) => downloadTelegramFile(token, fileId, fileName, directory, {
         maxFileSizeBytes: 20 * 1024 * 1024,
-    }), (method, fields, fileField, filePath, fileName) => callTelegramMultipart(token, method, fields, fileField, filePath, fileName));
+    }), (method, fields, fileField, filePath, fileName) => callTelegramMultipart(token, method, fields, fileField, filePath, fileName), transcribeVoice);
     const terminals = new Map();
     let local;
     const shutdown = () => { stopping = true; polling.abort(); };

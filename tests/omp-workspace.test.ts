@@ -118,6 +118,7 @@ class Harness {
   readonly created: Array<Record<string, unknown>> = [];
   readonly downloads: Array<{ fileId: string; fileName: string; directory: string; path: string }> = [];
   readonly uploads: Upload[] = [];
+  readonly transcriptions: string[] = [];
   private readonly listeners = new Set<() => void>();
   private updateId: number;
   private nextThread = 100;
@@ -161,6 +162,9 @@ class Harness {
       this.uploads.push({ method, fields, fileField, filePath, fileName });
       for (const listener of this.listeners) listener();
       return { message_id: this.uploads.length };
+    }, async (filePath) => {
+      this.transcriptions.push(filePath);
+      return "spoken request";
     });
   }
   notify(): void { for (const listener of this.listeners) listener(); }
@@ -458,6 +462,13 @@ test("Workspace archives supported attachments and recovers files from replied-t
     assert.match(recovered, /\[chat-attachments\] /);
     assert.deepEqual(h.downloads.map(({ fileId }) => fileId), ["new-file", "old-file"]);
     assert.match(h.downloads[1]!.directory, /\/77$/);
+    const afterVoice = h.sent.length;
+    await h.bridge.handle(h.incoming({
+      voice: { file_id: "voice-file", duration: 2, mime_type: "audio/ogg" },
+    }, threadId));
+    await h.reply("Steering applied", threadId, afterVoice);
+    assert.match(h.sessions.get(threadId)!.steers[1]!, /\[outputs\]\n- Voice transcript \(voice-\d+\.ogg\): spoken request/);
+    assert.deepEqual(h.transcriptions, [h.downloads[2]!.path]);
     h.sessions.get(threadId)!.complete("both files reviewed");
     await h.reply("both files reviewed", threadId);
   } finally {

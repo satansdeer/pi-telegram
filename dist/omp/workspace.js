@@ -6,7 +6,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { appendTelegramAttachmentSection, buildTelegramReplyContextBlock, downloadTelegramMessageFiles, extractTelegramMessageText, } from "../lib/media.js";
+import { appendTelegramAttachmentSection, appendTelegramListSection, buildTelegramReplyContextBlock, downloadTelegramMessageFiles, extractTelegramMessageText, } from "../lib/media.js";
 import { getTelegramTargetThreadParams } from "../lib/target.js";
 import { SessionLifecycleError } from "./rpc.js";
 const TYPING_REFRESH_MS = 3_000;
@@ -179,6 +179,7 @@ export class WorkspaceBridge {
     openSession;
     downloadFile;
     sendFile;
+    transcribeVoice;
     data;
     initialized = false;
     stopping = false;
@@ -193,7 +194,7 @@ export class WorkspaceBridge {
     busy = new Map();
     starts = new Map();
     groupSetup = false;
-    constructor(options, api, openSession, downloadFile, sendFile) {
+    constructor(options, api, openSession, downloadFile, sendFile, transcribeVoice) {
         if (!integer(options.ownerId) || !integer(options.botId) || !/^[A-Za-z0-9_]+$/.test(options.botUsername))
             throw new Error("Invalid Workspace bot/owner identity");
         this.options = { ...options, statePath: resolve(options.statePath), cwd: resolve(options.cwd) };
@@ -201,6 +202,7 @@ export class WorkspaceBridge {
         this.openSession = openSession;
         this.downloadFile = downloadFile;
         this.sendFile = sendFile;
+        this.transcribeVoice = transcribeVoice;
         this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
     }
     get offset() { return this.data.offset; }
@@ -570,6 +572,22 @@ export class WorkspaceBridge {
             },
         });
     }
+    async voiceTranscripts(files, label) {
+        const transcripts = [];
+        for (const file of files) {
+            if (file.kind !== "voice")
+                continue;
+            try {
+                const transcript = (await this.transcribeVoice(file.path)).trim();
+                if (transcript)
+                    transcripts.push(`${label} (${file.fileName}): ${transcript}`);
+            }
+            catch (error) {
+                console.error(`Voice transcription failed for ${file.path}:`, error);
+            }
+        }
+        return transcripts;
+    }
     async attachmentPrompt(message, target) {
         const media = message;
         let files = [];
@@ -593,6 +611,11 @@ export class WorkspaceBridge {
         const replyContext = buildTelegramReplyContextBlock(media, replyFiles);
         if (replyContext)
             prompt = prompt ? `${prompt}\n\n${replyContext}` : `_\n\n${replyContext}`;
+        const transcripts = [
+            ...await this.voiceTranscripts(files, "Voice transcript"),
+            ...await this.voiceTranscripts(replyFiles, "Replied voice transcript"),
+        ];
+        prompt = appendTelegramListSection(prompt, "outputs", transcripts);
         if (files.length || replyFiles.length)
             prompt += `\n\n[chat-attachments] ${this.attachmentArchive(target)}`;
         return prompt;
