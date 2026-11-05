@@ -22,6 +22,14 @@ if (!Number.isSafeInteger(ownerId) || ownerId <= 0) {
 const stateDir = resolve(process.env.OMP_WORKSPACE_STATE_DIR ?? join(homedir(), ".config", "omp-workspace"));
 const cwd = resolve(process.env.OMP_WORKSPACE_CWD ?? process.cwd());
 const binary = process.env.OMP_BINARY || "omp";
+const configuredModel = process.env.OMP_WORKSPACE_MODEL?.trim();
+const modelSeparator = configuredModel?.indexOf("/") ?? -1;
+if (configuredModel && (modelSeparator <= 0 || modelSeparator === configuredModel.length - 1)) {
+  throw new Error("OMP_WORKSPACE_MODEL must be provider/model-id");
+}
+const managedModel = configuredModel
+  ? { provider: configuredModel.slice(0, modelSeparator), id: configuredModel.slice(modelSeparator + 1) }
+  : undefined;
 let stopping = false;
 const polling = new AbortController();
 
@@ -122,7 +130,13 @@ if (process.argv.includes("--check")) {
       sessionDir: join(stateDir, "sessions", binding.id),
       resume: binding.sessionFile, onUi,
     });
-    await session.ready();
+    const state = await session.ready();
+    const activeModel = typeof state.model === "object" && state.model !== null && !Array.isArray(state.model)
+      ? state.model as Record<string, unknown>
+      : undefined;
+    if (managedModel && (activeModel?.provider !== managedModel.provider || activeModel.id !== managedModel.id)) {
+      await session.setModel(managedModel.provider, managedModel.id);
+    }
     return session;
   }, (fileId, fileName, directory) => downloadTelegramFile(token, fileId, fileName, directory, {
     maxFileSizeBytes: 20 * 1024 * 1024,

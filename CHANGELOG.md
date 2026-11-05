@@ -12,6 +12,7 @@
 - `OMP graceful restart`: `npm run omp:restart` stops polling, drains accepted prompts and side questions through delivery, then lets launchd start the built replacement. Startup failures with confirmed child cleanup no longer strand the daemon lock and block every restart; uncertain child shutdown still retains ownership. Missing-transcript topics stay latched without silently replacing their sessions.
 - `OMP steering and files`: Additional text or supported files in an active topic use native OMP steering; idle input starts a turn. Incoming files are archived by chat/topic/message, and replying to older files recovers them for later scans. Voice notes are locally transcribed with Whisper `small` before OMP receives the prompt. Assistant `local://` artifacts under the designated transcript are uploaded after containment, regular-file, 10-file, and 50 MB checks. `/btw` stays ephemeral.
 - `OMP missing-session repair`: `/repair` releases a managed topic only when its designated transcript is gone and no alternate transcript exists, preserving valid history, the Telegram topic, and archived attachments. The next normal message creates the replacement session; uninitialized topics now initialize on first use instead of remaining stuck.
+- `OMP managed model`: `OMP_WORKSPACE_MODEL=provider/model-id` now pins new and resumed daemon-owned topics to one model at session open, while an unset value preserves normal OMP model selection.
 
 ## 0.58.3: Typing Cancellation Diagnostics
 

@@ -23,6 +23,7 @@ const sessionId = resume || continued ? JSON.parse(readFileSync(sessionFile, "ut
 if (!resume && !continued) writeFileSync(sessionFile, JSON.stringify({type: "session", id: sessionId}) + "\n");
 const send = frame => process.stdout.write(JSON.stringify(frame) + "\n");
 const reply = (frame, data = {}) => send({type: "response", id: frame.id, command: frame.type, success: true, data});
+let model = {provider: "fixture", id: "default"};
 let active;
 let btw;
 let steering = [];
@@ -40,8 +41,11 @@ const input = createInterface({input: process.stdin, crlfDelay: Infinity});
 input.on("line", line => {
   const frame = JSON.parse(line);
   if (frame.type === "get_state") {
-    reply(frame, {sessionId: args.includes("--wrong-session") ? "wrong-session" : sessionId, sessionFile, pid: process.pid, isStreaming: !!active, continued, resume: resume ?? null,
+    reply(frame, {sessionId: args.includes("--wrong-session") ? "wrong-session" : sessionId, sessionFile, pid: process.pid, isStreaming: !!active, continued, resume: resume ?? null, model,
       tokenPresent: Object.keys(process.env).some(key => /TELEGRAM.*TOKEN|BOT_?TOKEN/i.test(key))});
+  } else if (frame.type === "set_model") {
+    model = {provider: frame.provider, id: frame.modelId};
+    reply(frame, model);
   } else if (frame.type === "prompt") {
     if (frame.message === "exit") process.exit(7);
     reply(frame, {agentInvoked: true});
@@ -102,6 +106,8 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     assert.equal(state.tokenPresent, false);
     assert.equal(state.continued, false);
     assert.equal((await stat(join(root, "topic"))).mode & 0o777, 0o700);
+    await session.setModel("openai-codex", "gpt-6.1-sol");
+    assert.deepEqual((await session.state()).model, { provider: "openai-codex", id: "gpt-6.1-sol" });
     const first = session.prompt("first");
     assert.equal(session.busy, true);
     await assert.rejects(session.prompt("concurrent"), /already processing/);

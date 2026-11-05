@@ -180,6 +180,12 @@ export class OmpSession {
             throw new Error("OMP get_state returned no state");
         return response.data;
     }
+    async setModel(provider, modelId) {
+        const response = await this.request("set_model", { provider, modelId });
+        if (!record(response.data) || response.data.provider !== provider || response.data.id !== modelId) {
+            throw new Error("OMP set_model did not select the requested model");
+        }
+    }
     async prompt(text) {
         if (this.busy)
             throw new Error("OMP session is already processing a prompt");

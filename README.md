@@ -17,6 +17,7 @@ Fork of [`llblab/pi-telegram`](https://github.com/llblab/pi-telegram), with an e
    export OMP_WORKSPACE_CWD="$HOME/Workspace"
    export OMP_BINARY="$HOME/.local/bin/omp"
    # Optional: OMP_WORKSPACE_STATE_DIR defaults to ~/.config/omp-workspace
+   # Optional: OMP_WORKSPACE_MODEL pins managed topics, including resumed sessions
    ```
 
 5. From this checkout, run `npm ci`, `npm run build`, then `npm run omp:check`. Start the compiled daemon with `node dist/omp/main.js`.

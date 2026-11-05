@@ -195,6 +195,13 @@ export class OmpSession {
     return response.data;
   }
 
+  async setModel(provider: string, modelId: string): Promise<void> {
+    const response = await this.request("set_model", { provider, modelId });
+    if (!record(response.data) || response.data.provider !== provider || response.data.id !== modelId) {
+      throw new Error("OMP set_model did not select the requested model");
+    }
+  }
+
   async prompt(text: string): Promise<string> {
     if (this.busy) throw new Error("OMP session is already processing a prompt");
     if (this.failure) throw this.failure;
