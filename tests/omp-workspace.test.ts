@@ -410,7 +410,7 @@ test("Workspace rejects unauthorized/unbound input, ignores other bot commands, 
     assert.equal(h.sessions.has(101), false);
     const prompt = h.update("one admitted turn", 101);
     await h.bridge.handle(prompt);
-    await h.until(() => h.sessions.get(101)!.prompts.length === 1);
+    await h.until(() => h.sessions.get(101)?.prompts.length === 1);
     await h.bridge.handle(prompt);
     const currentOffset = h.bridge.offset;
     await h.bridge.handle({ update_id: 0, message: { from: { id: OWNER }, chat: { id: GROUP }, text: "old input", message_thread_id: 101 } });
@@ -553,7 +553,7 @@ test("Workspace restart reports interrupted admission without replaying a prompt
     const threadId = await h.create();
     const update = h.update("do not replay", threadId);
     await h.bridge.handle(update);
-    await h.until(() => h.sessions.get(threadId)!.prompts.length === 1);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
     // Preserve the durable crash boundary, then unblock this fixture without mutating the copied snapshot.
     await copyFile(join(directory, "state.json"), join(recoveredDirectory, "state.json"));
     await h.sessions.get(threadId)!.abort();

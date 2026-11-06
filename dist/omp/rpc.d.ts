@@ -34,7 +34,7 @@ export declare class OmpSession {
     ready(): Promise<Record<string, unknown>>;
     state(): Promise<Record<string, unknown>>;
     setModel(provider: string, modelId: string): Promise<void>;
-    prompt(text: string): Promise<string>;
+    prompt(text: string, onProgress?: (text: string) => void): Promise<string>;
     steer(text: string): Promise<void>;
     btw(question: string): Promise<string>;
     abort(): Promise<void>;

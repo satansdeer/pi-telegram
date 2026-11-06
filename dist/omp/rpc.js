@@ -193,7 +193,7 @@ export class OmpSession {
             throw new Error("OMP set_model did not select the requested model");
         }
     }
-    async prompt(text) {
+    async prompt(text, onProgress) {
         if (this.busy)
             throw new Error("OMP session is already processing a prompt");
         if (this.failure)
@@ -205,7 +205,7 @@ export class OmpSession {
         void completion.promise.catch(() => undefined);
         const turn = {
             id: `workspace-${++this.sequence}`, resolve: completion.resolve, reject: completion.reject,
-            acknowledged: false, started: false, terminal: false, settled: false, text: "",
+            acknowledged: false, started: false, terminal: false, settled: false, text: "", onProgress,
         };
         this.turn = turn; // Admission must happen before the first await.
         try {
@@ -333,6 +333,8 @@ export class OmpSession {
         }
         if (frame.type === "message_end" && turn?.started && record(frame.message) && frame.message.role === "assistant") {
             turn.text = textOf(frame.message);
+            if (frame.message.stopReason === "toolUse" && turn.text.trim())
+                turn.onProgress?.(turn.text);
             if (frame.message.stopReason === "error")
                 turn.failure = errorOf(frame.message.errorMessage, "OMP provider request failed");
             if (frame.message.stopReason === "aborted")

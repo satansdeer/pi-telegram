@@ -54,7 +54,8 @@ input.on("line", line => {
     if (frame.message === "fail") finish(null, "error");
     else if (frame.message === "empty") finish(null);
     else {
-      send({type: "message_end", message: {role: "assistant", content: [{type: "text", text: "draft"}]}});
+      send({type: "message_end", message: {role: "assistant", stopReason: "toolUse", content: [
+        {type: "thinking", thinking: "private reasoning"}, {type: "text", text: "draft"}]}});
       send({type: "agent_end", isTerminal: false, messages: []});
       send({type: "prompt_result", id: frame.id, agentInvoked: true, status: "completed", sessionSettled: false});
       active.reported = true;
@@ -108,7 +109,8 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     assert.equal((await stat(join(root, "topic"))).mode & 0o777, 0o700);
     await session.setModel("openai-codex", "gpt-6.1-sol");
     assert.deepEqual((await session.state()).model, { provider: "openai-codex", id: "gpt-6.1-sol" });
-    const first = session.prompt("first");
+    const progress: string[] = [];
+    const first = session.prompt("first", (text) => { progress.push(text); });
     assert.equal(session.busy, true);
     await assert.rejects(session.prompt("concurrent"), /already processing/);
     const request = await ui.promise;
@@ -116,6 +118,7 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     void first.then(() => { settled = true; }, () => { settled = true; });
     assert.equal((await session.state()).isStreaming, true);
     assert.equal(settled, false, "a nonterminal agent_end and early result must not release the turn");
+    assert.deepEqual(progress, ["draft"], "public progress must arrive while the turn is still running");
     assert.equal(await session.btw("what is happening?"), "side:what is happening?");
     assert.equal(settled, false, "an ephemeral side question must not settle the main turn");
     await assert.rejects(session.btw("fail-sidecar"), /sidecar provider failed/);
@@ -123,6 +126,7 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     await session.steer("change direction");
     await session.answer(request.id, { value: "finish" });
     assert.equal(await first, "final:first|steer:change direction");
+    assert.deepEqual(progress, ["draft"], "the final answer must not be repeated as progress");
     assert.equal(session.busy, false);
     await assert.rejects(session.steer("too late"), /no active prompt/);
     assert.equal(await session.prompt("empty"), "", "an empty turn must not return the previous reply");

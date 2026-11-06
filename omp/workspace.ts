@@ -36,7 +36,7 @@ export interface UiRequest {
   [key: string]: unknown;
 }
 export interface SessionPort {
-  prompt(text: string): Promise<string>;
+  prompt(text: string, onProgress?: (text: string) => void): Promise<string>;
   steer(text: string): Promise<void>;
   btw(text: string): Promise<string>;
   abort(): Promise<void>;
@@ -526,11 +526,17 @@ export class WorkspaceBridge {
           if (binding.external) this.externalRegistration(binding, session);
           const stopTyping = this.startTyping(admission.target);
           let output: string;
+          let progress = Promise.resolve();
           try {
-            const prompt = session.prompt(promptText);
+            const prompt = session.prompt(promptText, (text) => {
+              progress = progress.then(() => this.sendMarkdown(admission.target, text)).catch((error: unknown) => {
+                console.error(`Workspace progress delivery failed for update ${admission.updateId}: ${diagnostic(error)}`);
+              });
+            });
             turnStarted?.();
             output = await prompt;
           } finally {
+            await progress;
             stopTyping();
           }
           await this.replyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");

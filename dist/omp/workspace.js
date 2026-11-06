@@ -527,12 +527,18 @@ export class WorkspaceBridge {
                         this.externalRegistration(binding, session);
                     const stopTyping = this.startTyping(admission.target);
                     let output;
+                    let progress = Promise.resolve();
                     try {
-                        const prompt = session.prompt(promptText);
+                        const prompt = session.prompt(promptText, (text) => {
+                            progress = progress.then(() => this.sendMarkdown(admission.target, text)).catch((error) => {
+                                console.error(`Workspace progress delivery failed for update ${admission.updateId}: ${diagnostic(error)}`);
+                            });
+                        });
                         turnStarted?.();
                         output = await prompt;
                     }
                     finally {
+                        await progress;
                         stopTyping();
                     }
                     await this.replyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");

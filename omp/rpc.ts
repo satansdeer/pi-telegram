@@ -22,6 +22,7 @@ type Turn = {
   text: string;
   result?: Frame;
   failure?: Error;
+  onProgress?: (text: string) => void;
 };
 type Sidecar = {
   id: string;
@@ -209,7 +210,7 @@ export class OmpSession {
     }
   }
 
-  async prompt(text: string): Promise<string> {
+  async prompt(text: string, onProgress?: (text: string) => void): Promise<string> {
     if (this.busy) throw new Error("OMP session is already processing a prompt");
     if (this.failure) throw this.failure;
     if (this.stopping) throw new Error("OMP session is stopping");
@@ -218,7 +219,7 @@ export class OmpSession {
     void completion.promise.catch(() => undefined);
     const turn: Turn = {
       id: `workspace-${++this.sequence}`, resolve: completion.resolve, reject: completion.reject,
-      acknowledged: false, started: false, terminal: false, settled: false, text: "",
+      acknowledged: false, started: false, terminal: false, settled: false, text: "", onProgress,
     };
     this.turn = turn; // Admission must happen before the first await.
     try {
@@ -330,6 +331,7 @@ export class OmpSession {
     }
     if (frame.type === "message_end" && turn?.started && record(frame.message) && frame.message.role === "assistant") {
       turn.text = textOf(frame.message);
+      if (frame.message.stopReason === "toolUse" && turn.text.trim()) turn.onProgress?.(turn.text);
       if (frame.message.stopReason === "error") turn.failure = errorOf(frame.message.errorMessage, "OMP provider request failed");
       if (frame.message.stopReason === "aborted") turn.failure = new Error("OMP prompt was aborted");
     }

@@ -14,7 +14,7 @@ export interface UiRequest {
     [key: string]: unknown;
 }
 export interface SessionPort {
-    prompt(text: string): Promise<string>;
+    prompt(text: string, onProgress?: (text: string) => void): Promise<string>;
     steer(text: string): Promise<void>;
     btw(text: string): Promise<string>;
     abort(): Promise<void>;
