@@ -14,6 +14,7 @@ import {
   extractTelegramMessageText,
 } from "../lib/media.ts";
 import type { DownloadedTelegramMessageFile, TelegramAttachmentSource, TelegramMediaMessage } from "../lib/media.ts";
+import { extractMarkdownLinkDestinations } from "../lib/rendering.ts";
 import { getTelegramTargetThreadParams } from "../lib/target.ts";
 import type { TelegramTarget } from "../lib/target.ts";
 import { SessionLifecycleError } from "./rpc.ts";
@@ -913,23 +914,33 @@ export class WorkspaceBridge {
   }
 
   private async localArtifacts(binding: Binding, body: string): Promise<string[]> {
-    if (!binding.sessionFile || !body.includes("local://")) return [];
-    let root: string;
-    try {
-      root = await realpath(join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local"));
-    } catch (error) {
-      if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) return [];
-      throw error;
+    const candidates: Array<{ root: string; name: string }> = [];
+    if (binding.sessionFile) {
+      const root = join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local");
+      for (const match of body.matchAll(LOCAL_ARTIFACT_URI)) {
+        if (!isAbsolute(match[1]!)) candidates.push({ root, name: match[1]! });
+      }
     }
+    for (const destination of extractMarkdownLinkDestinations(body)) {
+      if (!/^(?:[a-z][a-z\d+.-]*:|\/\/|#)/i.test(destination)) {
+        candidates.push({ root: binding.cwd, name: destination });
+      }
+    }
+    const roots = new Map<string, string>();
     const files: string[] = [];
     const seen = new Set<string>();
-    for (const match of body.matchAll(LOCAL_ARTIFACT_URI)) {
+    for (const candidate of candidates) {
       let artifactName: string;
-      try { artifactName = decodeURIComponent(match[1]!); }
+      try { artifactName = decodeURIComponent(candidate.name); }
       catch { continue; }
-      if (!artifactName || artifactName.includes("\0") || isAbsolute(artifactName)) continue;
+      if (!artifactName || artifactName.includes("\0")) continue;
+      let root: string;
       let file: string;
-      try { file = await realpath(resolve(root, artifactName)); }
+      try {
+        root = roots.get(candidate.root) ?? await realpath(candidate.root);
+        roots.set(candidate.root, root);
+        file = await realpath(resolve(root, artifactName));
+      }
       catch (error) {
         if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) continue;
         throw error;

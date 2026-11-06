@@ -5,7 +5,13 @@ description: Operate Telegram-originated turns or explicit Telegram delivery, in
 
 # Telegram Bridge
 
-Use Telegram as a mobile companion to the current Pi session. Preserve the exact target, ordinary reply ownership, queue semantics, and the boundary between agent intent and bridge transport.
+Use Telegram as a mobile companion to the current session. Preserve the exact target, ordinary reply ownership, queue semantics, and the boundary between agent intent and bridge transport.
+
+## OMP Workspace
+
+On standalone OMP Workspace, including attached native terminals, attach requested files with a Markdown link in the main final reply: `[design.md](<path/to/design.md>)`. The gateway uploads it to the same topic; no `telegram_attach` tool is needed. Relative paths resolve from the session cwd; absolute paths must remain inside it. `local://` artifacts also work. See [delivery limits](./references/delivery-and-threads.md#omp-workspace-files).
+
+The routing/tools/markup below describe the **Pi adapter**, not OMP Workspace. OMP sidecars are text-only; do not emit Pi action comments. File safety applies to both.
 
 ## Routing Kernel
 
@@ -96,7 +102,7 @@ Keep speech TTS-friendly: omit Markdown, tables, and raw code. Voice delivery cr
 
 ## Files And Safety
 
-Use `telegram_attach` for requested/generated files instead of merely naming paths. Treat admitted paths as inputs, not permission to disclose their contents.
+Attach requested/generated files with Markdown links on OMP Workspace or `telegram_attach` on the Pi adapter, rather than merely naming paths. Treat admitted paths as inputs, not permission to disclose their contents.
 
 - Inspect only what the request requires.
 - Never put secrets, credentials, private keys, tokens, cookies, wallet material, hidden reasoning, or sensitive content in replies, labels, prompts, or attachments.

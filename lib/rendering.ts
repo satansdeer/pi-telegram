@@ -319,6 +319,37 @@ function parseMarkdownAutolinkAt(
   }
   return { startIndex: index, endIndex, destination };
 }
+/** Explicit inline destinations, excluding fenced/indented code and inline code examples. */
+export function* extractMarkdownLinkDestinations(text: string): Generator<string> {
+  const lines = text.split("\n");
+  for (let lineIndex = 0; lineIndex < lines.length;) {
+    const line = lines[lineIndex]!;
+    const fence = parseMarkdownFence(line);
+    if (fence) {
+      lineIndex = collectFencedMarkdownCodeLines(lines, lineIndex, fence).nextIndex;
+      continue;
+    }
+    if (canStartIndentedCodeBlock(lines, lineIndex)) {
+      lineIndex = collectIndentedMarkdownCodeLines(lines, lineIndex).nextIndex;
+      continue;
+    }
+    for (let index = 0; index < line.length;) {
+      if (line[index] === "`" && !isEscapedMarkdownCharacter(line, index)) {
+        const marker = /^`+/.exec(line.slice(index))![0];
+        const end = line.indexOf(marker, index + marker.length);
+        index = end < 0 ? index + marker.length : end + marker.length;
+        continue;
+      }
+      const link = parseMarkdownInlineLinkAt(line, index);
+      if (link) {
+        yield link.destination.replace(/\\([\\()[\]<> ])/g, "$1");
+        index = link.endIndex + 1;
+      } else index++;
+    }
+    lineIndex++;
+  }
+}
+
 
 function replaceMarkdownLink(
   text: string,

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { scheduler } from "node:timers/promises";
 import { test } from "node:test";
 import { WorkspaceBridge } from "../omp/workspace.ts";
@@ -477,18 +477,26 @@ test("Workspace archives supported attachments and recovers files from replied-t
   }
 });
 
-test("Workspace uploads only contained regular local artifacts from an OMP reply", { timeout: 15000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-output-"));
+test("Workspace uploads linked workspace files and contained local artifacts without leaking outside either root", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-output-")));
   const statePath = join(directory, "state.json");
   const transcript = join(directory, "sessions", "turn.jsonl");
   const local = join(directory, "sessions", "turn", "local");
   const report = join(local, "reports", "mont.md");
   const secret = join(directory, "sessions", "turn", "secret.txt");
+  const cwd = join(directory, "workspace");
+  const design = join(cwd, "openspec", "design (final).md");
+  const absolute = join(cwd, "summary.txt");
+  await mkdir(join(cwd, "openspec"), { recursive: true });
+  await writeFile(design, "workspace design\n");
+  await writeFile(absolute, "workspace summary\n");
+  await writeFile(join(cwd, "example.md"), "code examples must not upload\n");
   await mkdir(join(local, "reports"), { recursive: true });
   await writeFile(report, "safe report\n");
   await writeFile(secret, "must not upload\n");
   await symlink(secret, join(local, "leak.txt"));
-  const h = new Harness(statePath);
+  await symlink(secret, join(cwd, "leak.txt"));
+  const h = new Harness(statePath, 0, cwd);
   let session: FakeSession | undefined;
   h.openSession = async (binding) => {
     session = new FakeSession({ ...binding, sessionFile: transcript }, () => h.notify());
@@ -504,16 +512,28 @@ test("Workspace uploads only contained regular local artifacts from an OMP reply
       "Done: [report](local://reports%2Fmont.md)",
       "[outside](local://../secret.txt)",
       "[symlink](local://leak.txt)",
+      "[design](<openspec/design (final).md>)",
+      `[summary](${absolute} "Summary")`,
+      "[duplicate](openspec/design%20%28final%29.md)",
+      "[outside](../sessions/turn/secret.txt)",
+      `[outside absolute](${secret})`,
+      "[symlink](leak.txt)",
+      "[web](https://example.com/summary.txt)",
+      "[directory](openspec)",
+      "[missing](missing.md)",
+      "[encoded traversal](%2e%2e/sessions/turn/secret.txt)",
+      "`[example](example.md)`",
+      "```markdown\n[example](example.md)\n```",
     ].join("\n"));
     await h.reply("Done:", threadId);
-    await h.until(() => h.uploads.length === 1);
-    assert.deepEqual(h.uploads, [{
+    await h.bridge.stop();
+    assert.deepEqual(h.uploads, [report, design, absolute].map((filePath) => ({
       method: "sendDocument",
       fields: { chat_id: String(GROUP), message_thread_id: String(threadId) },
       fileField: "document",
-      filePath: await realpath(report),
-      fileName: "mont.md",
-    }]);
+      filePath,
+      fileName: basename(filePath),
+    })));
   } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });

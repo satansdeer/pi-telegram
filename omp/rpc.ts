@@ -130,6 +130,13 @@ export class OmpSession {
       this.onUi = options.onUi;
       this.child = spawn(options.binary, [
         ...(options.args ?? []), "--mode", "rpc", "--session-dir", directory,
+        "--append-system-prompt",
+        "This session is connected through OMP Workspace to a Telegram topic. Answer normally; the gateway delivers your reply. "
+          + "To send a requested file, include a Markdown link in your main final reply, e.g. [report](<reports/report.pdf>). "
+          + "Relative paths resolve from your working directory; absolute paths must remain inside it. "
+          + "local:// links also upload files from this session's local artifact directory. "
+          + "The gateway attaches these files automatically to the same topic (up to 10 files, 50 MB each); no telegram_attach tool is needed. "
+          + "Do not link sensitive files without explicit delivery intent. Sidecar replies are text-only.",
         ...(resume ? ["--resume", resume] : this.recovered.size ? ["--continue"] : []),
       ], { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     } catch (error) {

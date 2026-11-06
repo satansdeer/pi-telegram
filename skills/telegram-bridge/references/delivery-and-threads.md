@@ -1,6 +1,18 @@
 # Direct Delivery And Threads
 
-Read this reference only for explicit local/TUI Telegram delivery, cross-target delivery, or Thread routing.
+Read this reference for OMP Workspace file delivery, or Pi adapter local/TUI delivery, cross-target delivery, or Thread routing.
+
+## OMP Workspace Files
+
+Include a Markdown link in the main final reply, such as `[design.md](<openspec/changes/example/design.md>)`. The gateway sends the file as a document to the current topic without a dedicated tool.
+
+- Relative paths resolve from the session cwd; absolute paths must stay inside it after symlink resolution. `local://` links use the exact session's local artifact directory instead.
+- Angle brackets support spaces and parentheses; percent-encoded paths also work. Bare paths do not attach anything.
+- Only existing regular files are sent. Workspace links inside code examples are ignored; duplicate destinations upload once.
+- Limit: 10 files per reply, 50 MB each. External URLs, missing files, directories, and files outside the permitted roots are not uploaded.
+- Sidecar replies are text-only. OMP Workspace does not implement the Pi adapter's direct-delivery tools or action markup.
+
+The remaining sections describe the Pi adapter.
 
 ## Direct Delivery
 

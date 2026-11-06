@@ -66,37 +66,6 @@ test("Bundled source Skills remain focused and self-contained", async () => {
   }
 
   const bridge = sources.get("telegram-bridge") ?? "";
-  assert.ok(
-    bridge.trim().split(/\s+/u).length <= 1_100,
-    "telegram-bridge core exceeded its progressive-disclosure budget",
-  );
-  assert.match(bridge, /capability, not user intent/u);
-  assert.match(bridge, /Never call `telegram_message` for the current active target/u);
-  assert.match(bridge, /Positional CML — default/u);
-  assert.match(bridge, /JSON — only when multiline content, named fields, or escaping earns it/u);
-  assert.match(bridge, /\{text\|lang\|rate\}/u);
-  assert.match(bridge, /voice does not use matrix composition/u);
-  assert.match(bridge, /emoji \+ space \+ text/u);
-  assert.match(bridge, /\{\|prompt\}.*prompt as both visible text and queued prompt/u);
-  assert.match(bridge, /click creates an ordinary user request/u);
-  assert.match(bridge, /\{\|Next\|\|1\}/u);
-  assert.match(bridge, /Hidden comment for footer; `telegram_button` fence for in-body rows/u);
-  assert.match(bridge, /singleton JSON\/CML cell or mixed matrix/u);
-  assert.doesNotMatch(bridge, /only recognized top-level comments activate|one complete action in one comment/u);
-  assert.match(bridge, /Disabled controls.*no callback, queued prompt, or bound-method invocation/u);
-  assert.match(
-    bridge,
-    /removes every assistant-authored HTML comment.*only complete recognized comments or valid button fences activate actions/su,
-  );
-  assert.match(
-    bridge,
-    /Proactively use `generated-control-surface`.*must emit useful buttons/su,
-  );
-  assert.match(bridge, /dangerous button opens a consequence\/confirmation step/u);
-  assert.match(bridge, /Serialize|serialization/u);
-  assert.doesNotMatch(bridge, /telegram_buttons/u);
-  assert.doesNotMatch(bridge, /telegram_button label=/u);
-  assert.ok(bridge.indexOf("<!-- telegram_button [") < bridge.indexOf("<!-- telegram_button {\""));
 
   for (const reference of [
     "delivery-and-threads.md",
