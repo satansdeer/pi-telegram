@@ -8,6 +8,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, u
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { appendTelegramAttachmentSection, appendTelegramListSection, buildTelegramReplyContextBlock, downloadTelegramMessageFiles, extractTelegramMessageText, } from "../lib/media.js";
 import { extractMarkdownLinkDestinations } from "../lib/rendering.js";
+import { splitTelegramNativeMarkdown } from "../lib/replies.js";
 import { getTelegramTargetThreadParams } from "../lib/target.js";
 import { SessionLifecycleError } from "./rpc.js";
 const TYPING_REFRESH_MS = 3_000;
@@ -50,9 +51,6 @@ function keys(value, allowed) {
 }
 function hasAttachment(message, kinds = ATTACHMENTS) {
     return kinds.some((key) => message[key] !== undefined);
-}
-function escapeHtml(value) {
-    return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 async function canonicalFile(path) {
     try {
@@ -1051,7 +1049,9 @@ export class WorkspaceBridge {
     }
     async replyWithArtifacts(admission, binding, body) {
         const files = await this.localArtifacts(binding, body);
-        await this.reply(admission, body);
+        admission.phase = "delivery";
+        await this.save();
+        await this.sendMarkdown(admission.target, body);
         for (const file of files) {
             await this.sendFile("sendDocument", {
                 chat_id: String(admission.target.chatId),
@@ -1067,7 +1067,7 @@ export class WorkspaceBridge {
     async replySidecar(admission, body) {
         admission.phase = "delivery";
         await this.save();
-        await this.sendSidecar(admission.target, body);
+        await this.sendMarkdown(admission.target, `💭 **Sidecar**\n\n${body.split("\n").map((line) => `>${line}`).join("\n")}`);
     }
     async send(target, body) {
         // Conservative UTF-16 chunks also fit Telegram's 4096-character ceiling.
@@ -1079,18 +1079,13 @@ export class WorkspaceBridge {
             start = end;
         }
     }
-    async sendSidecar(target, body) {
-        for (let start = 0; start < body.length;) {
-            let end = Math.min(start + 4_000, body.length);
-            if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]))
-                end--;
-            await this.api("sendMessage", {
+    async sendMarkdown(target, body) {
+        for (const markdown of splitTelegramNativeMarkdown(body)) {
+            await this.api("sendRichMessage", {
                 chat_id: target.chatId,
                 ...getTelegramTargetThreadParams(target),
-                text: `💭 <b>Sidecar</b>\n<blockquote>${escapeHtml(body.slice(start, end))}</blockquote>`,
-                parse_mode: "HTML",
+                rich_message: { markdown },
             });
-            start = end;
         }
     }
     async complete(admission) {

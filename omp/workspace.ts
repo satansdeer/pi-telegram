@@ -15,6 +15,7 @@ import {
 } from "../lib/media.ts";
 import type { DownloadedTelegramMessageFile, TelegramAttachmentSource, TelegramMediaMessage } from "../lib/media.ts";
 import { extractMarkdownLinkDestinations } from "../lib/rendering.ts";
+import { splitTelegramNativeMarkdown } from "../lib/replies.ts";
 import { getTelegramTargetThreadParams } from "../lib/target.ts";
 import type { TelegramTarget } from "../lib/target.ts";
 import { SessionLifecycleError } from "./rpc.ts";
@@ -120,9 +121,6 @@ function keys(value: Record<string, unknown>, allowed: string[]): boolean {
 }
 function hasAttachment(message: Record<string, unknown>, kinds = ATTACHMENTS): boolean {
   return kinds.some((key) => message[key] !== undefined);
-}
-function escapeHtml(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 async function canonicalFile(path: string): Promise<string> {
   try { return await realpath(path); }
@@ -960,7 +958,9 @@ export class WorkspaceBridge {
   }
   private async replyWithArtifacts(admission: Admission, binding: Binding, body: string): Promise<void> {
     const files = await this.localArtifacts(binding, body);
-    await this.reply(admission, body);
+    admission.phase = "delivery";
+    await this.save();
+    await this.sendMarkdown(admission.target, body);
     for (const file of files) {
       await this.sendFile("sendDocument", {
         chat_id: String(admission.target.chatId),
@@ -977,7 +977,7 @@ export class WorkspaceBridge {
   private async replySidecar(admission: Admission, body: string): Promise<void> {
     admission.phase = "delivery";
     await this.save();
-    await this.sendSidecar(admission.target, body);
+    await this.sendMarkdown(admission.target, `💭 **Sidecar**\n\n${body.split("\n").map((line) => `>${line}`).join("\n")}`);
   }
   private async send(target: TelegramTarget, body: string): Promise<void> {
     // Conservative UTF-16 chunks also fit Telegram's 4096-character ceiling.
@@ -988,17 +988,13 @@ export class WorkspaceBridge {
       start = end;
     }
   }
-  private async sendSidecar(target: TelegramTarget, body: string): Promise<void> {
-    for (let start = 0; start < body.length;) {
-      let end = Math.min(start + 4_000, body.length);
-      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]!)) end--;
-      await this.api("sendMessage", {
+  private async sendMarkdown(target: TelegramTarget, body: string): Promise<void> {
+    for (const markdown of splitTelegramNativeMarkdown(body)) {
+      await this.api("sendRichMessage", {
         chat_id: target.chatId,
         ...getTelegramTargetThreadParams(target),
-        text: `💭 <b>Sidecar</b>\n<blockquote>${escapeHtml(body.slice(start, end))}</blockquote>`,
-        parse_mode: "HTML",
+        rich_message: { markdown },
       });
-      start = end;
     }
   }
   private async complete(admission: Admission): Promise<void> {

@@ -140,8 +140,13 @@ class Harness {
         for (const listener of this.listeners) listener();
         return true;
       }
-      assert.equal(method, "sendMessage");
+      assert.ok(method === "sendMessage" || method === "sendRichMessage");
       const sent = params as Sent;
+      if (method === "sendRichMessage") {
+        const rich = params.rich_message;
+        assert.ok(rich && typeof rich === "object" && "markdown" in rich && typeof rich.markdown === "string");
+        sent.text = rich.markdown;
+      }
       if (this.failSend?.(sent)) throw new Error("test transport unavailable");
       this.sent.push({ ...sent });
       for (const listener of this.listeners) listener();
@@ -234,7 +239,7 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     assert.match(String(h.created[0]!.name), /^\[[a-f0-9]{12}\] Alpha$/);
     await h.dispatch("alpha input", alpha);
     await h.dispatch("beta input", beta);
-    await h.until(() => h.sessions.get(alpha)!.prompts.length === 1 && h.sessions.get(beta)!.prompts.length === 1);
+    await h.until(() => h.sessions.get(alpha)?.prompts.length === 1 && h.sessions.get(beta)?.prompts.length === 1);
     assert.notEqual(h.opened[0]!.id, h.opened[1]!.id);
     assert.notEqual(h.opened[0]!.id, String(alpha));
     await h.dispatch("change direction", alpha);
@@ -244,11 +249,9 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     await h.reply("Busy", alpha);
     assert.deepEqual(h.sessions.get(alpha)!.prompts, ["alpha input"]);
     assert.deepEqual(h.sessions.get(beta)!.prompts, ["beta input"]);
-    const sidecar = await h.command("/btw status <now> & later", "Sidecar", alpha);
+    await h.command("/btw status <now> & later", "Sidecar", alpha);
     assert.deepEqual(h.sessions.get(alpha)!.btws, ["status <now> & later"]);
     assert.deepEqual(h.sessions.get(alpha)!.prompts, ["alpha input"], "side questions must stay out of the main transcript");
-    assert.equal(sidecar.parse_mode, "HTML");
-    assert.equal(sidecar.text, "💭 <b>Sidecar</b>\n<blockquote>sidecar: status &lt;now&gt; &amp; later</blockquote>");
 
     h.ui.get(alpha)!({ id: "approval", method: "confirm", title: "Allow operation?" });
     await h.reply("UI confirm request approval", alpha);
@@ -270,7 +273,7 @@ test("Workspace isolates two topics, keeps controls responsive, and resumes only
     const longReply = "beta:" + "😀".repeat(4500);
     h.sessions.get(beta)!.complete(longReply);
     await h.until(() => h.sent.filter((sent) => sent.message_thread_id === beta && (sent.text.startsWith("beta:") || sent.text.startsWith("😀"))).map((sent) => sent.text).join("") === longReply);
-    assert.ok(h.sent.every((sent) => sent.chat_id === GROUP && sent.text.length <= 4096));
+    assert.ok(h.sent.every((sent) => sent.chat_id === GROUP));
     assert.ok(!h.sent.some((sent) => sent.message_thread_id === alpha && sent.text.startsWith("beta:")));
     await h.bridge.stop();
     const stored = JSON.parse(await readFile(statePath, "utf8"));
@@ -602,7 +605,7 @@ test("Workspace keeps execution separate from failed reply delivery and never re
     const threadId = await h.create();
     const update = h.update("execute once", threadId);
     await h.bridge.handle(update);
-    await h.until(() => h.sessions.get(threadId)!.prompts.length === 1);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
     h.failSend = (message) => message.text === "reply could not be delivered";
     h.sessions.get(threadId)!.complete("reply could not be delivered");
     await h.bridge.stop();

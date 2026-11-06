@@ -98,7 +98,7 @@ export declare class WorkspaceBridge {
     private reply;
     private replySidecar;
     private send;
-    private sendSidecar;
+    private sendMarkdown;
     private complete;
     private save;
     private track;

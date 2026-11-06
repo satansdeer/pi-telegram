@@ -9,6 +9,8 @@ Use Telegram as a mobile companion to the current session. Preserve the exact ta
 
 ## OMP Workspace
 
+Assistant answers use Telegram-native Rich Markdown, including headings, lists, links, code, tables, and math. `/btw` replies preserve rich formatting inside a quoted `💭 Sidecar` message; bridge status and diagnostics remain plain text.
+
 On standalone OMP Workspace, including attached native terminals, attach requested files with a Markdown link in the main final reply: `[design.md](<path/to/design.md>)`. The gateway uploads it to the same topic; no `telegram_attach` tool is needed. Relative paths resolve from the session cwd; absolute paths must remain inside it. `local://` artifacts also work. See [delivery limits](./references/delivery-and-threads.md#omp-workspace-files).
 
 The routing/tools/markup below describe the **Pi adapter**, not OMP Workspace. OMP sidecars are text-only; do not emit Pi action comments. File safety applies to both.
