@@ -10,7 +10,7 @@ import { scheduler } from "node:timers/promises";
 import { test } from "node:test";
 import { WorkspaceBridge } from "../omp/workspace.ts";
 import type { Binding, SessionPort, UiRequest } from "../omp/workspace.ts";
-import { OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
+import { CompletedReplyError, OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
 
 const OWNER = 42;
 const BOT = 99;
@@ -118,11 +118,15 @@ class Harness {
   readonly created: Array<Record<string, unknown>> = [];
   readonly downloads: Array<{ fileId: string; fileName: string; directory: string; path: string }> = [];
   readonly uploads: Upload[] = [];
+  readonly uploadContents: string[] = [];
   readonly transcriptions: string[] = [];
   private readonly listeners = new Set<() => void>();
   private updateId: number;
   private nextThread = 100;
   failSend?: (message: Sent) => boolean;
+  beforeSend?: (message: Sent) => Promise<void>;
+  failUpload?: (upload: Upload) => boolean;
+  beforeUpload?: (upload: Upload) => Promise<void>;
   beforeCreateTopic?: () => Promise<void>;
   openSession?: (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort | undefined>;
   constructor(statePath: string, offset = 0, cwd = "/workspace") {
@@ -148,6 +152,7 @@ class Harness {
         sent.text = rich.markdown;
       }
       if (this.failSend?.(sent)) throw new Error("test transport unavailable");
+      await this.beforeSend?.(sent);
       this.sent.push({ ...sent });
       for (const listener of this.listeners) listener();
       return { message_id: this.sent.length };
@@ -165,6 +170,9 @@ class Harness {
       return path;
     }, async (method, fields, fileField, filePath, fileName) => {
       this.uploads.push({ method, fields, fileField, filePath, fileName });
+      await this.beforeUpload?.(this.uploads[this.uploads.length - 1]!);
+      this.uploadContents.push(await readFile(filePath, "utf8"));
+      if (this.failUpload?.(this.uploads[this.uploads.length - 1]!)) throw new Error("upload acknowledgement lost");
       for (const listener of this.listeners) listener();
       return { message_id: this.uploads.length };
     }, async (filePath) => {
@@ -208,6 +216,9 @@ class Harness {
     this.listeners.add(check);
     check();
     await promise;
+  }
+  async drain(): Promise<void> {
+    while (!this.bridge.idle) await scheduler.yield();
   }
   async reply(contains: string, threadId?: number, after = 0): Promise<Sent> {
     await this.until(() => this.sent.slice(after).some((sent) => sent.message_thread_id === threadId && sent.text.includes(contains)));
@@ -530,16 +541,85 @@ test("Workspace uploads linked workspace files and contained local artifacts wit
     ].join("\n"));
     await h.reply("Done:", threadId);
     await h.bridge.stop();
-    assert.deepEqual(h.uploads, [report, design, absolute].map((filePath) => ({
+    assert.deepEqual(h.uploads.map(({ filePath: _filePath, ...upload }) => upload), [report, design, absolute].map((filePath) => ({
       method: "sendDocument",
       fields: { chat_id: String(GROUP), message_thread_id: String(threadId) },
       fileField: "document",
-      filePath,
       fileName: basename(filePath),
     })));
+    assert.deepEqual(h.uploadContents, ["safe report\n", "workspace design\n", "workspace summary\n"]);
+    for (const upload of h.uploads) await assert.rejects(stat(upload.filePath), { code: "ENOENT" });
   } finally {
     await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace uploads a pinned private snapshot even if the source is retargeted during transport", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-pinned-")));
+  const cwd = join(directory, "project");
+  const source = join(cwd, "report.txt");
+  const secret = join(directory, "secret.txt");
+  await mkdir(cwd);
+  await writeFile(source, "approved report");
+  await writeFile(secret, "outside secret");
+  const h = new Harness(join(directory, "state.json"), 0, cwd);
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    await h.dispatch("report", threadId);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    h.beforeUpload = async (upload) => {
+      assert.equal(upload.fileName, "report.txt");
+      await rm(source);
+      await symlink(secret, source);
+    };
+    h.sessions.get(threadId)!.complete("Done [report](report.txt)");
+    await h.drain();
+    assert.deepEqual(h.uploadContents, ["approved report"]);
+    assert.equal(h.uploads.length, 1);
+    await assert.rejects(stat(h.uploads[0]!.filePath), { code: "ENOENT" });
+  } finally {
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace durably retries ordinary command replies and sidecars without repeating their commands", { timeout: 15000 }, async () => {
+  for (const command of ["/status", "/btw saved side question"]) {
+    const directory = await mkdtemp(join(tmpdir(), "omp-workspace-command-reply-"));
+    const statePath = join(directory, "state.json");
+    const h = new Harness(statePath);
+    let resumed: Harness | undefined;
+    try {
+      await h.bindWorkspace();
+      const threadId = await h.create();
+      await h.dispatch("initialize", threadId);
+      await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+      h.sessions.get(threadId)!.complete("initialized");
+      await h.drain();
+      h.failSend = (message) => message.text.includes(command === "/status" ? "Pending UI:" : "sidecar: saved side question");
+      await h.dispatch(command, threadId);
+      await h.drain();
+      const saved = JSON.parse(await readFile(statePath, "utf8"));
+      const parts = saved.admissions[0].reply.parts as Array<{ kind: string; body: string }>;
+      assert.equal(parts[0]!.kind, command === "/status" ? "text" : "markdown");
+      if (command !== "/status") assert.match(parts[0]!.body, /Sidecar/);
+      await h.bridge.stop();
+      resumed = new Harness(statePath, saved.offset);
+      await resumed.bridge.init();
+      assert.equal(resumed.sent.length, 2);
+      assert.match(resumed.sent[0]!.text, /may duplicate/);
+      assert.equal(resumed.sent[1]!.text, parts[0]!.body);
+      assert.ok(resumed.sent.every((message) => message.chat_id === GROUP && message.message_thread_id === threadId));
+      assert.equal(resumed.opened.length, 0);
+      assert.deepEqual(h.sessions.get(threadId)!.btws, command === "/status" ? [] : ["saved side question"]);
+      assert.equal(JSON.parse(await readFile(statePath, "utf8")).admissions.length, 0);
+    } finally {
+      await h.bridge.stop();
+      await resumed?.bridge.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 });
 
@@ -595,10 +675,12 @@ test("Workspace corrupt, foreign, and numerically unsafe state fails closed with
   }
 });
 
-test("Workspace keeps execution separate from failed reply delivery and never reruns it", { timeout: 15000 }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-delivery-"));
+test("Workspace recovers saved text and attachments after failed delivery without executing or opening OMP", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-delivery-")));
   const statePath = join(directory, "state.json");
-  const h = new Harness(statePath);
+  const attachment = join(directory, "report.txt");
+  await writeFile(attachment, "saved report");
+  const h = new Harness(statePath, 0, directory);
   let resumed: Harness | undefined;
   try {
     await h.bindWorkspace();
@@ -606,24 +688,276 @@ test("Workspace keeps execution separate from failed reply delivery and never re
     const update = h.update("execute once", threadId);
     await h.bridge.handle(update);
     await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
-    h.failSend = (message) => message.text === "reply could not be delivered";
-    h.sessions.get(threadId)!.complete("reply could not be delivered");
+    const body = "reply could not be delivered [report](report.txt)";
+    h.failSend = (message) => message.text === body;
+    h.sessions.get(threadId)!.complete(body);
     await h.bridge.stop();
     const stored = JSON.parse(await readFile(statePath, "utf8"));
     assert.equal(stored.admissions.length, 1);
-    assert.equal(stored.admissions[0].phase, "report");
-    assert.match(stored.admissions[0].diagnostic, /execution will not be repeated/);
+    assert.equal(stored.admissions[0].phase, "delivery");
+    assert.equal(stored.admissions[0].reply.cursor, 0);
+    assert.equal(stored.admissions[0].reply.inFlight, true);
+    assert.equal(stored.admissions[0].reply.parts[0].body, body);
+    assert.equal(stored.admissions[0].reply.parts[1].path, attachment);
     assert.deepEqual(h.sessions.get(threadId)!.prompts, ["execute once"]);
-    resumed = new Harness(statePath, stored.offset);
+    resumed = new Harness(statePath, stored.offset, directory);
     await resumed.bridge.init();
-    await resumed.reply("execution will not be repeated", threadId);
+    assert.match(resumed.sent[0]!.text, /may duplicate/);
+    assert.equal(resumed.sent[1]!.text, body);
+    assert.ok(resumed.sent.every((message) => message.chat_id === GROUP && message.message_thread_id === threadId));
+    assert.deepEqual(resumed.uploads.map(({ fileName, fields }) => ({ fileName, fields })), [{
+      fileName: "report.txt", fields: { chat_id: String(GROUP), message_thread_id: String(threadId) },
+    }]);
+    assert.deepEqual(resumed.uploadContents, ["saved report"]);
     await resumed.bridge.handle(update);
     assert.equal(resumed.opened.length, 0);
     assert.equal(resumed.created.length, 0);
-    await resumed.bridge.stop();
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).admissions.length, 0);
   } finally {
     await h.bridge.stop();
     await resumed?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace recovery preserves acknowledged chunks and files and warns before an uncertain file retry", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-parts-")));
+  const statePath = join(directory, "state.json");
+  const first = join(directory, "first.txt");
+  const second = join(directory, "second.txt");
+  await writeFile(first, "first");
+  await writeFile(second, "second");
+  const h = new Harness(statePath, 0, directory);
+  let resumed: Harness | undefined;
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    await h.dispatch("create files", threadId);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    h.failUpload = ({ fileName }) => fileName === "second.txt";
+    h.sessions.get(threadId)!.complete(`${"a".repeat(33_000)}\n\n[first](first.txt) [second](second.txt)`);
+    await h.bridge.stop();
+    const saved = JSON.parse(await readFile(statePath, "utf8"));
+    const reply = saved.admissions[0].reply;
+    assert.ok(reply.parts.filter((part: { kind: string }) => part.kind === "markdown").length > 1);
+    assert.equal(reply.cursor, reply.parts.length - 1);
+    assert.equal(reply.parts[reply.cursor].path, second);
+    assert.equal(reply.inFlight, true);
+    assert.deepEqual(h.uploads.map(({ fileName }) => fileName), ["first.txt", "second.txt"]);
+    resumed = new Harness(statePath, saved.offset, directory);
+    await resumed.bridge.init();
+    assert.equal(resumed.sent.length, 1, "no acknowledged text chunk is resent");
+    assert.match(resumed.sent[0]!.text, /may duplicate/);
+    assert.equal(resumed.sent[0]!.message_thread_id, threadId);
+    assert.deepEqual(resumed.uploads.map(({ fileName }) => fileName), ["second.txt"], "only the uncertain file is retried");
+    assert.deepEqual(resumed.uploadContents, ["second"]);
+    assert.equal(resumed.opened.length, 0);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).admissions.length, 0);
+  } finally {
+    await h.bridge.stop();
+    await resumed?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace delivery retries are bounded, nonblocking, exclusive, and drained on shutdown", { timeout: 15000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 100_000 });
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-retry-"));
+  const h = new Harness(join(directory, "state.json"));
+  const gate = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    await h.dispatch("one turn", threadId);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    let failures = 0;
+    h.failSend = ({ text }) => {
+      if (text !== "saved answer") return false;
+      failures++;
+      return true;
+    };
+    h.sessions.get(threadId)!.complete("saved answer");
+    await h.drain();
+    await h.bridge.retryDeliveries();
+    await h.drain();
+    assert.equal(failures, 1, "normal polling must not hammer a failed delivery");
+    t.mock.timers.tick(30_000);
+    await h.bridge.retryDeliveries();
+    await h.drain();
+    assert.equal(failures, 2, "current-process failures become eligible again");
+    h.failSend = undefined;
+    t.mock.timers.tick(30_000);
+    h.beforeSend = async ({ text }) => {
+      if (text === "saved answer") { entered.resolve(); await gate.promise; }
+    };
+    await h.bridge.retryDeliveries();
+    await entered.promise;
+    await h.bridge.retryDeliveries();
+    await h.command("/status", "Idle", threadId);
+    assert.equal(h.sent.filter(({ text }) => text === "saved answer").length, 0);
+    let stopped = false;
+    const stopping = h.bridge.stop().then(() => { stopped = true; });
+    await scheduler.yield();
+    assert.equal(stopped, false, "shutdown waits for an in-flight delivery");
+    gate.resolve();
+    await stopping;
+    assert.equal(h.sent.filter(({ text }) => text === "saved answer").length, 1);
+    assert.deepEqual(h.sessions.get(threadId)!.prompts, ["one turn"]);
+    assert.equal(h.opened.length, 1);
+    assert.equal(JSON.parse(await readFile(join(directory, "state.json"), "utf8")).admissions.length, 0);
+    const count = h.sent.length;
+    await h.bridge.retryDeliveries();
+    assert.equal(h.sent.length, count);
+  } finally {
+    gate.resolve();
+    await h.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace preserves a proven completed answer with an explicit late-error warning", { timeout: 15000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-late-error-"));
+  const h = new Harness(join(directory, "state.json"));
+  let resumed: Harness | undefined;
+  h.openSession = async (binding) => {
+    const session = new FakeSession(binding, () => h.notify());
+    session.prompt = async (body) => {
+      session.prompts.push(body);
+      throw new CompletedReplyError("Completed despite disconnect", new Error("read ECONNRESET"));
+    };
+    h.sessions.set(binding.threadId, session);
+    return session;
+  };
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    h.failSend = ({ text }) => text.includes("Completed despite disconnect");
+    await h.dispatch("finish once", threadId);
+    await h.drain();
+    const saved = JSON.parse(await readFile(join(directory, "state.json"), "utf8"));
+    const body = saved.admissions[0].reply.parts.map((part: { body: string }) => part.body).join("");
+    assert.match(body, /Completed despite disconnect/);
+    assert.match(body, /final answer completed.*later OMP lifecycle\/transport step failed: read ECONNRESET/);
+    assert.match(body, /Later lifecycle steps are not confirmed/);
+    assert.doesNotMatch(body, /Update .* failed:/);
+    assert.deepEqual(h.sessions.get(threadId)!.prompts, ["finish once"]);
+    await h.bridge.stop();
+    resumed = new Harness(join(directory, "state.json"), saved.offset);
+    await resumed.bridge.init();
+    assert.ok(resumed.sent.some((message) => message.message_thread_id === threadId
+      && message.text.includes("Completed despite disconnect") && message.text.includes("Later lifecycle steps are not confirmed")));
+    assert.equal(resumed.opened.length, 0);
+  } finally {
+    await h.bridge.stop();
+    await resumed?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace rejects invalid saved replies instead of resetting or delivering them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "omp-workspace-invalid-reply-"));
+  const statePath = join(directory, "state.json");
+  const target = { chatId: GROUP, threadId: 51 };
+  const valid = { target, parts: [{ kind: "markdown", body: "saved answer" }], cursor: 0 };
+  const invalid = [
+    { ...valid, cursor: -1 },
+    { ...valid, cursor: 2 },
+    { ...valid, cursor: 1, inFlight: true },
+    { ...valid, inFlight: false },
+    { ...valid, retryAt: "tomorrow" },
+    { ...valid, target: { ...target, chatId: GROUP - 1 } },
+    { ...valid, target: { ...target, threadId: 52 } },
+    { ...valid, parts: [] },
+    { ...valid, parts: [{ kind: "markdown", body: "answer", hidden: true }] },
+    { ...valid, parts: [{ kind: "text", body: "x".repeat(4097) }] },
+    { ...valid, parts: [{ kind: "file", root: directory, path: join(directory, "..", "secret") }] },
+    { ...valid, parts: [{ kind: "file", root: directory, path: "relative.txt" }] },
+    { ...valid, parts: Array.from({ length: 11 }, (_, index) => ({ kind: "file", root: directory, path: join(directory, `${index}.txt`) })) },
+    { ...valid, surprise: "not allowed" },
+  ];
+  try {
+    for (const reply of invalid) {
+      const source = JSON.stringify({
+        version: 1, ownerId: OWNER, botId: BOT, offset: 2, bindings: [], admissions: [{
+          updateId: 1, target, kind: "prompt", phase: "delivery", reply,
+        }],
+      });
+      await writeFile(statePath, source);
+      const h = new Harness(statePath);
+      await assert.rejects(h.bridge.init(), /Invalid Workspace state/);
+      assert.equal(await readFile(statePath, "utf8"), source);
+      assert.equal(h.sent.length, 0);
+      assert.equal(h.uploads.length, 0);
+      assert.equal(h.opened.length, 0);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace rechecks pending files after restart and never uploads a symlink retarget outside the allowed root", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-retarget-")));
+  const cwd = join(directory, "project");
+  const statePath = join(directory, "state.json");
+  const file = join(cwd, "report.txt");
+  const secret = join(directory, "secret.txt");
+  await mkdir(cwd);
+  await writeFile(file, "safe report");
+  await writeFile(secret, "private");
+  const h = new Harness(statePath, 0, cwd);
+  let resumed: Harness | undefined;
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    await h.dispatch("report", threadId);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    h.failUpload = () => true;
+    h.sessions.get(threadId)!.complete("Done [report](report.txt)");
+    await h.bridge.stop();
+    const saved = JSON.parse(await readFile(statePath, "utf8"));
+    await rm(file);
+    await symlink(secret, file);
+    resumed = new Harness(statePath, saved.offset, cwd);
+    await resumed.bridge.init();
+    assert.equal(resumed.uploads.length, 0);
+    assert.equal(resumed.opened.length, 0);
+    assert.match(resumed.sent[0]!.text, /may duplicate/);
+    const pending = JSON.parse(await readFile(statePath, "utf8")).admissions[0];
+    assert.equal(pending.phase, "delivery");
+    assert.equal(pending.reply.cursor, 1, "acknowledged text stays acknowledged even if the file becomes unsafe");
+    assert.equal(pending.reply.parts[1].path, file);
+    assert.match(pending.diagnostic, /canonical allowed path|symbolic links|ELOOP/);
+  } finally {
+    await h.bridge.stop();
+    await resumed?.bridge.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Workspace attachment preparation errors preserve completed text and explain the missing uploads", { timeout: 15000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "omp-workspace-preparation-")));
+  const h = new Harness(join(directory, "state.json"), 0, directory);
+  const links = [];
+  for (let index = 0; index < 11; index++) {
+    await writeFile(join(directory, `${index}.txt`), String(index));
+    links.push(`[${index}](${index}.txt)`);
+  }
+  try {
+    await h.bindWorkspace();
+    const threadId = await h.create();
+    await h.dispatch("many outputs", threadId);
+    await h.until(() => h.sessions.get(threadId)?.prompts.length === 1);
+    const body = `Completed report.\n${links.join("\n")}`;
+    h.sessions.get(threadId)!.complete(body);
+    await h.drain();
+    assert.ok(h.sent.some((message) => message.message_thread_id === threadId && message.text === body));
+    assert.ok(h.sent.some((message) => message.message_thread_id === threadId
+      && message.text.includes("answer is complete") && message.text.includes("attachment preparation failed")));
+    assert.equal(h.uploads.length, 0);
+    assert.equal(JSON.parse(await readFile(join(directory, "state.json"), "utf8")).admissions.length, 0);
+  } finally {
+    await h.bridge.stop();
     await rm(directory, { recursive: true, force: true });
   }
 });

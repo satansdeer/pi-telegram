@@ -63,8 +63,11 @@ export declare class WorkspaceBridge {
     private readonly busy;
     private readonly starts;
     private groupSetup;
+    private readonly activeAdmissions;
+    private readonly delivering;
     constructor(options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile, sendFile: SendFile, transcribeVoice: TranscribeVoice);
     get offset(): number;
+    get idle(): boolean;
     /** Registration is ephemeral: no topic creation, persistence, or implicit reattachment. */
     register(port: SessionPort, onAttach: (binding: TerminalBinding) => Promise<void>): Promise<void>;
     /** A separate queue keeps slow attachments out of Telegram admission/control handling. */
@@ -75,6 +78,8 @@ export declare class WorkspaceBridge {
     private terminalBinding;
     private attachedBinding;
     init(): Promise<void>;
+    /** Schedule only saved delivery work; never reopen a session or block polling on Telegram. */
+    retryDeliveries(): Promise<void>;
     /** Admit durably, then run turns in the background so controls stay responsive. */
     handle(update: unknown): Promise<void>;
     private admit;
@@ -94,9 +99,15 @@ export declare class WorkspaceBridge {
     private onUi;
     private startTyping;
     private localArtifacts;
-    private replyWithArtifacts;
+    private prepareReply;
+    private prepareReplyWithArtifacts;
     private reply;
     private replySidecar;
+    private validateArtifact;
+    private sendArtifact;
+    private deliver;
+    private deliveryFailed;
+    private recoverDelivery;
     private send;
     private sendMarkdown;
     private complete;

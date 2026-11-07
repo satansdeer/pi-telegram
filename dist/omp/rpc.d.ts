@@ -3,6 +3,11 @@ export type UiRequest = {
     method: string;
     [key: string]: unknown;
 };
+/** Preserves a proven final answer without hiding a later RPC/lifecycle failure. */
+export declare class CompletedReplyError extends Error {
+    readonly reply: string;
+    constructor(reply: string, cause: Error);
+}
 /** Carries child-ownership proof without treating a failed operation as success. */
 export declare class SessionLifecycleError extends Error {
     readonly shutdownConfirmed: boolean;

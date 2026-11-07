@@ -197,6 +197,7 @@ if (process.argv.includes("--check")) {
         updates = await api("getUpdates", { offset: bridge.offset, timeout: 25, allowed_updates: ["message"] });
       } catch (error) {
         if (stopping) break;
+      await bridge.retryDeliveries();
         if (error instanceof TelegramError && [401, 403, 409].includes(error.code)) throw error;
         console.error(error instanceof Error ? error.message : "Telegram polling failed");
         await delay(error instanceof TelegramError && error.retryAfter ? error.retryAfter * 1000 : 3_000);

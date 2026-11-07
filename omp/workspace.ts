@@ -4,8 +4,11 @@
  * Owns no polling or API transport. Topics and transcripts are never deleted or replaced.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   appendTelegramAttachmentSection,
   appendTelegramListSection,
@@ -15,10 +18,10 @@ import {
 } from "../lib/media.ts";
 import type { DownloadedTelegramMessageFile, TelegramAttachmentSource, TelegramMediaMessage } from "../lib/media.ts";
 import { extractMarkdownLinkDestinations } from "../lib/rendering.ts";
-import { splitTelegramNativeMarkdown } from "../lib/replies.ts";
+import { splitTelegramNativeMarkdown, TELEGRAM_RICH_MESSAGE_MAX_CHARS } from "../lib/replies.ts";
 import { getTelegramTargetThreadParams } from "../lib/target.ts";
 import type { TelegramTarget } from "../lib/target.ts";
-import { SessionLifecycleError } from "./rpc.ts";
+import { CompletedReplyError, SessionLifecycleError } from "./rpc.ts";
 
 export interface Binding {
   id: string;
@@ -51,17 +54,27 @@ type SendFile = (
 const TYPING_REFRESH_MS = 3_000;
 const MAX_LOCAL_ARTIFACTS = 10;
 const MAX_LOCAL_ARTIFACT_BYTES = 50 * 1024 * 1024;
+const DELIVERY_RETRY_MS = 30_000;
 const LOCAL_ARTIFACT_URI = /\blocal:\/\/([^\s<>"')\]]+)/g;
 type OpenSession = (binding: Binding, onUi: (request: UiRequest) => void) => Promise<SessionPort>;
 type DownloadFile = (fileId: string, fileName: string, directory: string) => Promise<string>;
 type TranscribeVoice = (filePath: string) => Promise<string>;
 type Options = { statePath: string; cwd: string; ownerId: number; botId: number; botUsername: string };
+type ReplyPart = { kind: "text" | "markdown"; body: string } | { kind: "file"; root: string; path: string };
+type PendingReply = {
+  target: TelegramTarget;
+  parts: ReplyPart[];
+  cursor: number;
+  inFlight?: true;
+  retryAt?: number;
+};
 type Admission = {
   updateId: number;
   target: TelegramTarget;
   kind: string;
   phase: "admitted" | "running" | "delivery" | "report";
   diagnostic?: string;
+  reply?: PendingReply;
 };
 type State = {
   version: 1;
@@ -148,6 +161,21 @@ function targetOf(message: Record<string, unknown>): TelegramTarget | undefined 
     ? { chatId: message.chat.id }
     : { chatId: message.chat.id, threadId: message.message_thread_id as number };
 }
+function containedFile(root: string, file: string): boolean {
+  const path = relative(root, file);
+  return Boolean(path) && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+function plainParts(body: string): ReplyPart[] {
+  const parts: ReplyPart[] = [];
+  // Conservative UTF-16 chunks also fit Telegram's 4096-character ceiling.
+  for (let start = 0; start < body.length;) {
+    let end = Math.min(start + 4096, body.length);
+    if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]!)) end--;
+    parts.push({ kind: "text", body: body.slice(start, end) });
+    start = end;
+  }
+  return parts;
+}
 function parseState(value: unknown, options: Options): State {
   const invalid = () => { throw new Error("Invalid Workspace state; refusing to reset or replay it"); };
   if (!record(value) || !keys(value, ["version", "ownerId", "botId", "offset", "groupId", "bindings", "admissions"])) return invalid();
@@ -178,12 +206,36 @@ function parseState(value: unknown, options: Options): State {
   if (value.bindings.length && value.groupId === undefined) return invalid();
   const updates = new Set<number>();
   for (const admission of value.admissions) {
-    if (!record(admission) || !keys(admission, ["updateId", "target", "kind", "phase", "diagnostic"])) return invalid();
+    if (!record(admission) || !keys(admission, ["updateId", "target", "kind", "phase", "diagnostic", "reply"])) return invalid();
     if (!integer(admission.updateId, 0) || admission.updateId >= value.offset || updates.has(admission.updateId)
       || !record(admission.target) || !keys(admission.target, ["chatId", "threadId"]) || !chatId(admission.target.chatId)
       || (admission.target.threadId !== undefined && !integer(admission.target.threadId)) || !text(admission.kind)
       || !["admitted", "running", "delivery", "report"].includes(admission.phase as string)
       || (admission.diagnostic !== undefined && !text(admission.diagnostic))) return invalid();
+    if (admission.reply !== undefined) {
+      const reply = admission.reply;
+      if (admission.phase !== "delivery" || !record(reply) || !keys(reply, ["target", "parts", "cursor", "inFlight", "retryAt"])
+        || !record(reply.target) || !keys(reply.target, ["chatId", "threadId"]) || !chatId(reply.target.chatId)
+        || reply.target.chatId !== admission.target.chatId
+        || (reply.target.threadId !== admission.target.threadId && (admission.kind !== "new"
+          || !threads.has(reply.target.threadId as number)))
+        || (reply.target.threadId !== undefined && !integer(reply.target.threadId))
+        || !Array.isArray(reply.parts) || !reply.parts.length || !integer(reply.cursor, 0) || reply.cursor > reply.parts.length
+        || (reply.inFlight !== undefined && (reply.inFlight !== true || reply.cursor === reply.parts.length))
+        || (reply.retryAt !== undefined && !integer(reply.retryAt, 0))) return invalid();
+      let files = 0;
+      for (const part of reply.parts) {
+        if (!record(part)) return invalid();
+        if (part.kind === "text" || part.kind === "markdown") {
+          if (!keys(part, ["kind", "body"]) || !text(part.body)
+            || part.body.length > (part.kind === "text" ? 4096 : TELEGRAM_RICH_MESSAGE_MAX_CHARS)) return invalid();
+        } else if (part.kind === "file") {
+          if (!keys(part, ["kind", "root", "path"]) || !text(part.root) || !isAbsolute(part.root)
+            || !text(part.path) || !isAbsolute(part.path) || resolve(part.root) !== part.root || resolve(part.path) !== part.path
+            || !containedFile(part.root, part.path) || ++files > MAX_LOCAL_ARTIFACTS) return invalid();
+        } else return invalid();
+      }
+    }
     updates.add(admission.updateId);
   }
   return value as unknown as State;
@@ -238,6 +290,8 @@ export class WorkspaceBridge {
   private readonly busy = new Map<number, number>();
   private readonly starts = new Map<number, Promise<void>>();
   private groupSetup = false;
+  private readonly activeAdmissions = new Set<Admission>();
+  private readonly delivering = new Set<Admission>();
 
   constructor(
     options: Options, api: Api, openSession: OpenSession, downloadFile: DownloadFile,
@@ -253,6 +307,7 @@ export class WorkspaceBridge {
     this.data = { version: 1, ownerId: options.ownerId, botId: options.botId, offset: 0, bindings: [], admissions: [] };
   }
   get offset(): number { return this.data.offset; }
+  get idle(): boolean { return this.jobs.size === 0; }
 
   /** Registration is ephemeral: no topic creation, persistence, or implicit reattachment. */
   async register(port: SessionPort, onAttach: (binding: TerminalBinding) => Promise<void>): Promise<void> {
@@ -395,21 +450,26 @@ export class WorkspaceBridge {
       try { parsed = JSON.parse(source); } catch { throw new Error("Malformed Workspace state JSON; refusing to reset or replay it"); }
       this.data = parseState(parsed, this.options);
     } else await this.save();
-    // An admission is durable before any external effect. We can never know which
-    // side of a crash a Telegram/OMP commit reached: report, never replay it.
     for (const admission of [...this.data.admissions]) {
-      const notice = admission.diagnostic ?? `Update ${admission.updateId} was interrupted during ${admission.kind} (${admission.phase}). Its outcome may be ambiguous. It will not be replayed; inspect the topic and OMP transcript before sending again. Telegram, OMP, and local state cannot commit exactly once together.`;
-      admission.phase = "report";
-      admission.diagnostic = notice;
-      await this.save();
-      try {
-        await this.send(admission.target, notice);
-        await this.complete(admission);
-      } catch (error) {
-        console.error(`Workspace recovery delivery failed for update ${admission.updateId}: ${diagnostic(error)}`);
+      if (!admission.reply) {
+        // Without a proven completed reply, execution must never be replayed.
+        const notice = admission.diagnostic ?? `Update ${admission.updateId} was interrupted during ${admission.kind} (${admission.phase}). Its outcome may be ambiguous. It will not be replayed; inspect the topic and OMP transcript before sending again. Telegram, OMP, and local state cannot commit exactly once together.`;
+        admission.diagnostic = notice;
+        await this.prepareReply(admission, plainParts(notice));
       }
+      await this.recoverDelivery(admission);
     }
     this.initialized = true;
+  }
+
+  /** Schedule only saved delivery work; never reopen a session or block polling on Telegram. */
+  async retryDeliveries(): Promise<void> {
+    if (!this.initialized || this.stopping || this.fatal) return;
+    for (const admission of this.data.admissions) {
+      if (!admission.reply || this.activeAdmissions.has(admission) || this.delivering.has(admission)
+        || (admission.reply.retryAt ?? 0) > Date.now()) continue;
+      this.track(this.recoverDelivery(admission));
+    }
   }
 
   /** Admit durably, then run turns in the background so controls stay responsive. */
@@ -480,7 +540,9 @@ export class WorkspaceBridge {
     };
     this.data.admissions.push(admission);
     await this.save();
+    this.activeAdmissions.add(admission);
     this.track(this.process(admission, message, command, refusal, steeringReady, turnStarted).finally(() => {
+      this.activeAdmissions.delete(admission);
       turnStarted?.();
       if (reserved && target.threadId !== undefined) {
         const count = this.busy.get(target.threadId) ?? 0;
@@ -534,29 +596,33 @@ export class WorkspaceBridge {
               });
             });
             turnStarted?.();
-            output = await prompt;
+            try { output = await prompt; }
+            catch (error) {
+              if (!(error instanceof CompletedReplyError)) throw error;
+              output = `${error.reply || "OMP completed without a text reply."}\n\n⚠️ The final answer completed, but a later OMP lifecycle/transport step failed: ${diagnostic(error)}. Later lifecycle steps are not confirmed; this prompt will not be rerun.`;
+            }
+            await this.prepareReplyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");
           } finally {
             await progress;
             stopTyping();
           }
-          await this.replyWithArtifacts(admission, binding, output || "OMP completed without a text reply.");
+          await this.deliver(admission);
         }
       }
       await this.complete(admission);
     } catch (error) {
-      const delivery = admission.phase === "delivery";
+      if (admission.reply) {
+        await this.deliveryFailed(admission, error);
+        return;
+      }
       admission.phase = "report";
-      admission.diagnostic = delivery
-        ? `Reply delivery or completion commit failed for update ${admission.updateId}. Handling/model execution will not be repeated to deliver it. Inspect this topic's designated OMP transcript. ${diagnostic(error)}`
-        : `Update ${admission.updateId} (${admission.kind}) failed: ${diagnostic(error)}. It will not be replayed; any started operation may have an ambiguous outcome. Inspect this topic/transcript before sending again.`;
+      admission.diagnostic = `Update ${admission.updateId} (${admission.kind}) failed: ${diagnostic(error)}. It will not be replayed; any started operation may have an ambiguous outcome. Inspect this topic/transcript before sending again.`;
       console.error(`Workspace: ${admission.diagnostic}`);
       try {
-        await this.save();
-        if (!delivery) {
-          await this.send(admission.target, admission.diagnostic);
-          await this.complete(admission);
-        }
+        await this.reply(admission, admission.diagnostic);
+        await this.complete(admission);
       } catch (reportError) {
+        if (admission.reply) await this.deliveryFailed(admission, reportError);
         console.error(`Workspace failure report could not be committed/delivered: ${diagnostic(reportError)}`);
       }
     }
@@ -917,7 +983,7 @@ export class WorkspaceBridge {
     };
   }
 
-  private async localArtifacts(binding: Binding, body: string): Promise<string[]> {
+  private async localArtifacts(binding: Binding, body: string): Promise<Array<Extract<ReplyPart, { kind: "file" }>>> {
     const candidates: Array<{ root: string; name: string }> = [];
     if (binding.sessionFile) {
       const root = join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local");
@@ -931,7 +997,7 @@ export class WorkspaceBridge {
       }
     }
     const roots = new Map<string, string>();
-    const files: string[] = [];
+    const files: Array<Extract<ReplyPart, { kind: "file" }>> = [];
     const seen = new Set<string>();
     for (const candidate of candidates) {
       let artifactName: string;
@@ -949,8 +1015,7 @@ export class WorkspaceBridge {
         if (record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) continue;
         throw error;
       }
-      const contained = relative(root, file);
-      if (!contained || contained === ".." || contained.startsWith(`..${sep}`) || isAbsolute(contained) || seen.has(file)) continue;
+      if (!containedFile(root, file) || seen.has(file)) continue;
       const info = await stat(file);
       if (!info.isFile()) continue;
       if (info.size > MAX_LOCAL_ARTIFACT_BYTES) {
@@ -958,40 +1023,136 @@ export class WorkspaceBridge {
       }
       if (files.length === MAX_LOCAL_ARTIFACTS) throw new Error(`OMP reply contains more than ${MAX_LOCAL_ARTIFACTS} local files`);
       seen.add(file);
-      files.push(file);
+      files.push({ kind: "file", root, path: file });
     }
     return files;
   }
-  private async replyWithArtifacts(admission: Admission, binding: Binding, body: string): Promise<void> {
-    const files = await this.localArtifacts(binding, body);
+  private async prepareReply(admission: Admission, parts: ReplyPart[], target = admission.target): Promise<void> {
     admission.phase = "delivery";
+    admission.reply = { target: { ...target }, parts, cursor: 0 };
     await this.save();
-    await this.sendMarkdown(admission.target, body);
-    for (const file of files) {
-      await this.sendFile("sendDocument", {
-        chat_id: String(admission.target.chatId),
-        ...(admission.target.threadId === undefined ? {} : { message_thread_id: String(admission.target.threadId) }),
-      }, "document", file, basename(file));
-    }
   }
-
-  private async reply(admission: Admission, body: string, target = admission.target): Promise<void> {
-    admission.phase = "delivery";
+  private async prepareReplyWithArtifacts(admission: Admission, binding: Binding, body: string): Promise<void> {
+    // Save completed text first: artifact discovery must never erase the answer.
+    await this.prepareReply(admission, splitTelegramNativeMarkdown(body).map((body) => ({ kind: "markdown", body })));
+    try {
+      admission.reply!.parts.push(...await this.localArtifacts(binding, body));
+    } catch (error) {
+      admission.reply!.parts.push(...plainParts(`⚠️ The answer is complete, but local attachment preparation failed: ${diagnostic(error)}. Inspect its file links locally.`));
+    }
     await this.save();
-    await this.send(target, body);
+  }
+  private async reply(admission: Admission, body: string, target = admission.target): Promise<void> {
+    await this.prepareReply(admission, plainParts(body), target);
+    await this.deliver(admission);
   }
   private async replySidecar(admission: Admission, body: string): Promise<void> {
-    admission.phase = "delivery";
-    await this.save();
-    await this.sendMarkdown(admission.target, `💭 **Sidecar**\n\n${body.split("\n").map((line) => `>${line}`).join("\n")}`);
+    const markdown = `💭 **Sidecar**\n\n${body.split("\n").map((line) => `>${line}`).join("\n")}`;
+    await this.prepareReply(admission, splitTelegramNativeMarkdown(markdown).map((body) => ({ kind: "markdown", body })));
+    await this.deliver(admission);
+  }
+  private async validateArtifact(target: TelegramTarget, part: Extract<ReplyPart, { kind: "file" }>): Promise<{ dev: number; ino: number }> {
+    const binding = target.chatId === this.data.groupId
+      ? this.data.bindings.find((entry) => entry.threadId === target.threadId) : undefined;
+    if (!binding) throw new Error("Pending attachment has no designated topic");
+    const roots = [binding.cwd];
+    if (binding.sessionFile) roots.push(join(dirname(binding.sessionFile), basename(binding.sessionFile, ".jsonl"), "local"));
+    let allowed = false;
+    for (const root of roots) {
+      try { if (await realpath(root) === part.root) allowed = true; }
+      catch (error) { if (!(record(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))) throw error; }
+    }
+    if (!allowed || await realpath(part.root) !== part.root || await realpath(part.path) !== part.path
+      || !containedFile(part.root, part.path)) throw new Error("Pending attachment no longer has its canonical allowed path");
+    const info = await lstat(part.path);
+    if (!info.isFile() || info.size > MAX_LOCAL_ARTIFACT_BYTES) throw new Error("Pending attachment is not a regular file within the Telegram size limit");
+    return info;
+  }
+  private async sendArtifact(reply: PendingReply, part: Extract<ReplyPart, { kind: "file" }>): Promise<void> {
+    const source = await open(part.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let directory: string | undefined;
+    try {
+      const expected = await this.validateArtifact(reply.target, part);
+      const info = await source.stat();
+      if (!info.isFile() || info.size > MAX_LOCAL_ARTIFACT_BYTES || info.dev !== expected.dev || info.ino !== expected.ino) {
+        throw new Error("Pending attachment changed while opening its canonical allowed path");
+      }
+      // SendFile accepts paths, so pin the approved inode and stage privately before its later read.
+      directory = await mkdtemp(`${this.options.statePath}.upload-`);
+      const snapshot = join(directory, basename(part.path));
+      let bytes = 0;
+      await pipeline(source.createReadStream({ autoClose: false }), new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length;
+          callback(bytes > MAX_LOCAL_ARTIFACT_BYTES ? new Error("Pending attachment grew beyond the Telegram size limit") : null, chunk);
+        },
+      }), createWriteStream(snapshot, { flags: "wx", mode: 0o600 }));
+      reply.inFlight = true;
+      await this.save();
+      await this.sendFile("sendDocument", {
+        chat_id: String(reply.target.chatId),
+        ...(reply.target.threadId === undefined ? {} : { message_thread_id: String(reply.target.threadId) }),
+      }, "document", snapshot, basename(part.path));
+    } finally {
+      try { await source.close(); }
+      finally { if (directory) await rm(directory, { recursive: true, force: true }); }
+    }
+  }
+  private async deliver(admission: Admission): Promise<void> {
+    if (this.delivering.has(admission)) throw new Error("Reply delivery already active");
+    this.delivering.add(admission);
+    try {
+      const reply = admission.reply!;
+      reply.retryAt = Date.now() + DELIVERY_RETRY_MS;
+      await this.save();
+      if (reply.inFlight) {
+        await this.send(reply.target, `⚠️ Delivery recovery for update ${admission.updateId}: the next saved reply part may already have reached Telegram and may duplicate. Only unacknowledged parts will be retried; model execution will not be repeated. Exactly-once delivery cannot be guaranteed.`);
+      }
+      while (reply.cursor < reply.parts.length) {
+        const part = reply.parts[reply.cursor]!;
+        if (part.kind === "file") {
+          await this.sendArtifact(reply, part);
+        } else {
+          // A crash or network error after this commit leaves this exact part uncertain.
+          reply.inFlight = true;
+          await this.save();
+          if (part.kind === "markdown") {
+            await this.api("sendRichMessage", {
+              chat_id: reply.target.chatId, ...getTelegramTargetThreadParams(reply.target), rich_message: { markdown: part.body },
+            });
+          } else {
+            await this.api("sendMessage", { chat_id: reply.target.chatId, ...getTelegramTargetThreadParams(reply.target), text: part.body });
+          }
+        }
+        reply.cursor++;
+        delete reply.inFlight;
+        await this.save();
+      }
+    } finally {
+      this.delivering.delete(admission);
+    }
+  }
+  private async deliveryFailed(admission: Admission, error: unknown): Promise<void> {
+    admission.diagnostic = `Reply delivery remains pending for update ${admission.updateId}; saved text/files are retained and execution will not be repeated. ${diagnostic(error)}`;
+    if (admission.reply) admission.reply.retryAt = Date.now() + DELIVERY_RETRY_MS;
+    console.error(`Workspace: ${admission.diagnostic}`);
+    try { await this.save(); }
+    catch (error) { console.error(`Workspace pending delivery commit failed: ${diagnostic(error)}`); }
+  }
+  private async recoverDelivery(admission: Admission): Promise<void> {
+    this.activeAdmissions.add(admission);
+    try {
+      await this.deliver(admission);
+      await this.complete(admission);
+    } catch (error) {
+      await this.deliveryFailed(admission, error);
+    } finally {
+      this.activeAdmissions.delete(admission);
+    }
   }
   private async send(target: TelegramTarget, body: string): Promise<void> {
-    // Conservative UTF-16 chunks also fit Telegram's 4096-character ceiling.
-    for (let start = 0; start < body.length;) {
-      let end = Math.min(start + 4096, body.length);
-      if (end < body.length && /[\uD800-\uDBFF]/.test(body[end - 1]!)) end--;
-      await this.api("sendMessage", { chat_id: target.chatId, ...getTelegramTargetThreadParams(target), text: body.slice(start, end) });
-      start = end;
+    for (const part of plainParts(body)) {
+      if (part.kind === "text") await this.api("sendMessage", { chat_id: target.chatId, ...getTelegramTargetThreadParams(target), text: part.body });
     }
   }
   private async sendMarkdown(target: TelegramTarget, body: string): Promise<void> {

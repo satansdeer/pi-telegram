@@ -7,7 +7,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
-import { OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
+import { CompletedReplyError, OmpSession, SessionLifecycleError } from "../omp/rpc.ts";
 import type { UiRequest } from "../omp/rpc.ts";
 
 const fixture = String.raw`
@@ -27,11 +27,11 @@ let model = {provider: "fixture", id: "default"};
 let active;
 let btw;
 let steering = [];
-function finish(text, status = "completed") {
+function finish(text, status = "completed", stopReason = status === "completed" ? "stop" : status) {
   const current = active;
   active = undefined;
-  const message = {role: "assistant", content: [{type: "text", text: text ?? ""}], stopReason: status === "completed" ? "stop" : status,
-    ...(status === "error" ? {errorMessage: "provider rejected the turn"} : {})};
+  const message = {role: "assistant", content: [{type: "text", text: text ?? ""}], stopReason,
+    ...(stopReason === "error" ? {errorMessage: "provider rejected the turn"} : {})};
   if (text !== null || status === "aborted") send({type: "message_end", message});
   send({type: "agent_end", isTerminal: true, messages: text === null ? [] : [message]});
   if (!current.reported) send({type: "prompt_result", id: current.id, agentInvoked: true, status, sessionSettled: true,
@@ -48,11 +48,47 @@ input.on("line", line => {
     reply(frame, model);
   } else if (frame.type === "prompt") {
     if (frame.message === "exit") process.exit(7);
-    reply(frame, {agentInvoked: true});
+    if (frame.message === "ack-reject") {
+      send({type: "response", id: frame.id, command: "prompt", success: false, error: "prompt was rejected"});
+      return;
+    }
+    if (!["late-ack-error", "ack-before-terminal"].includes(frame.message)) reply(frame, {agentInvoked: true});
     active = frame;
     send({type: "agent_start"});
     if (frame.message === "fail") finish(null, "error");
     else if (frame.message === "empty") finish(null);
+    else if (frame.message === "retry-success") {
+      send({type: "message_end", message: {role: "assistant", stopReason: "error", errorMessage: "temporary provider failure",
+        content: [{type: "text", text: "failed attempt"}]}});
+      send({type: "agent_end", isTerminal: false, messages: []});
+      send({type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0, errorMessage: "temporary provider failure"});
+      send({type: "auto_retry_end", success: true, attempt: 1});
+      finish("after retry");
+    } else if (frame.message === "late-result-error" || frame.message === "late-frame-error") {
+      active.reported = true;
+      finish("saved final");
+      if (frame.message === "late-frame-error") send({type: "rpc_frame_error"});
+      else send({type: "prompt_result", id: frame.id, agentInvoked: true, status: "error", sessionSettled: true,
+        error: {message: "late RPC ECONNRESET"}});
+    } else if (frame.message === "late-ack-error") {
+      finish("saved final");
+      send({type: "response", id: frame.id, command: "prompt", success: false, error: "late acknowledgement failed"});
+    } else if (frame.message === "result-before-terminal" || frame.message === "ack-before-terminal") {
+      active.finalText = "saved final";
+      send({type: "message_end", message: {role: "assistant", stopReason: "stop", content: [{type: "text", text: active.finalText}]}});
+      if (frame.message === "result-before-terminal") {
+        active.reported = true;
+        send({type: "prompt_result", id: frame.id, agentInvoked: true, status: "error", sessionSettled: false,
+          error: {message: "late RPC ECONNRESET"}});
+      } else send({type: "response", id: frame.id, command: "prompt", success: false, error: "late acknowledgement failed"});
+      send({type: "extension_ui_request", id: "ui-" + frame.id, method: "input", prompt: frame.message});
+    } else if (frame.message === "provider-error") finish("partial", "error");
+    else if (frame.message === "aborted-output") finish("partial", "aborted");
+    else if (frame.message === "draft-error") {
+      send({type: "message_end", message: {role: "assistant", stopReason: "stop", content: [{type: "text", text: "superseded final"}]}});
+      finish("draft", "error", "toolUse");
+    } else if (frame.message === "draft-completed") finish("draft", "completed", "toolUse");
+    else if (frame.message === "aborted-after-stop") finish("not a completed run", "aborted", "stop");
     else {
       send({type: "message_end", message: {role: "assistant", stopReason: "toolUse", content: [
         {type: "thinking", thinking: "private reasoning"}, {type: "text", text: "draft"}]}});
@@ -74,9 +110,9 @@ input.on("line", line => {
   } else if (frame.type === "steer") {
     steering.push(frame.message);
     reply(frame);
-  } else if (frame.type === "extension_ui_response" && active) {
+  } else if (frame.type === "extension_ui_response" && active && frame.id === "ui-" + active.id) {
     if (frame.cancelled) finish(null, "aborted");
-    else finish("final:" + active.message + (steering.length ? "|steer:" + steering.join(",") : ""));
+    else finish(active.finalText ?? ("final:" + active.message + (steering.length ? "|steer:" + steering.join(",") : "")));
   } else if (frame.type === "abort") {
     reply(frame);
     if (active) finish(null, "aborted");
@@ -148,6 +184,113 @@ test("OMP admits one turn, keeps controls responsive, and never reuses old outpu
     if (oldToken === undefined) delete process.env.OMP_TELEGRAM_BOT_TOKEN;
     else process.env.OMP_TELEGRAM_BOT_TOKEN = oldToken;
     try { await session.stop(); } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("OMP preserves proven final replies with late RPC errors, not failed attempts or drafts", { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-rpc-completion-"));
+  const script = join(root, "fixture.mjs");
+  await writeFile(script, fixture);
+  const session = new OmpSession({ binary: process.execPath, args: [script], cwd: root, sessionDir: join(root, "topic"), onUi() {} });
+  try {
+    await session.ready();
+    const cause = new Error("original failure");
+    assert.equal(new CompletedReplyError("saved final", cause).cause, cause);
+    for (const [prompt, failure] of [
+      ["late-result-error", "late RPC ECONNRESET"], ["late-ack-error", "late acknowledgement failed"],
+    ] as const) {
+      await assert.rejects(session.prompt(prompt), (error: unknown) => {
+        assert.ok(error instanceof CompletedReplyError);
+        assert.equal(error.reply, "saved final");
+        assert.equal(error.message, failure);
+        assert.ok(error.cause instanceof Error);
+        assert.equal(error.cause.message, failure);
+        return true;
+      });
+      assert.equal(session.busy, false);
+      assert.equal(await session.prompt("empty"), "", "settled failure must release admission without retaining prior reply text");
+    }
+    assert.equal(await session.prompt("retry-success"), "after retry", "an intermediate provider error must not poison its successful retry");
+    for (const prompt of ["ack-reject", "fail", "provider-error", "aborted-output", "draft-error", "aborted-after-stop"]) {
+      await assert.rejects(session.prompt(prompt), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(!(error instanceof CompletedReplyError), prompt);
+        assert.match(error.message, /rejected|aborted/);
+        return true;
+      });
+      assert.equal(session.busy, false);
+      assert.equal(await session.prompt("empty"), "");
+    }
+    assert.equal(await session.prompt("draft-completed"), "", "a terminal toolUse draft is not a completed final reply");
+    await assert.rejects(session.prompt("late-frame-error"), (error: unknown) => error instanceof CompletedReplyError
+      && error.reply === "saved final" && error.cause instanceof Error && /transport limit/.test(error.cause.message));
+    await assert.rejects(session.prompt("empty"), /transport limit/, "a saved reply must not hide a failed transport");
+  } finally {
+    await session.stop().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("OMP rejects authoritative errors immediately but retains started-turn admission until terminal proof", { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-rpc-terminal-"));
+  const script = join(root, "fixture.mjs");
+  await writeFile(script, fixture);
+  let ui = Promise.withResolvers<UiRequest>();
+  const session = new OmpSession({ binary: process.execPath, args: [script], cwd: root, sessionDir: join(root, "topic"),
+    onUi(request) { ui.resolve(request); } });
+  try {
+    await session.ready();
+    for (const [prompt, cancelled] of [
+      ["result-before-terminal", false], ["ack-before-terminal", false], ["result-before-terminal", true],
+    ] as const) {
+      const completion = session.prompt(prompt);
+      let settled = false;
+      void completion.then(() => { settled = true; }, () => { settled = true; });
+      const request = await ui.promise;
+      await session.state();
+      assert.equal(settled, true, "authoritative RPC errors must reject even when terminal agent_end never arrives");
+      assert.equal(session.busy, true);
+      await assert.rejects(session.prompt("concurrent"), /already processing/);
+      await assert.rejects(completion, (error: unknown) => error instanceof Error && !(error instanceof CompletedReplyError)
+        && /late RPC ECONNRESET|late acknowledgement failed/.test(error.message));
+      await session.answer(request.id, cancelled ? { cancelled: true } : { value: "finish" });
+      await session.state();
+      assert.equal(session.busy, false);
+      assert.equal(await session.prompt("empty"), "");
+      ui = Promise.withResolvers<UiRequest>();
+    }
+  } finally {
+    await session.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("OMP ignores a previous turn's delayed UI delivery failure", { timeout: 15_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "omp-rpc-ui-owner-"));
+  const script = join(root, "fixture.mjs");
+  await writeFile(script, fixture);
+  const delivery = Promise.withResolvers<void>();
+  let ui = Promise.withResolvers<UiRequest>();
+  const session = new OmpSession({ binary: process.execPath, args: [script], cwd: root, sessionDir: join(root, "topic"),
+    onUi(request) { ui.resolve(request); if (request.prompt === "stale-ui") return delivery.promise; } });
+  try {
+    await session.ready();
+    const first = session.prompt("stale-ui");
+    const oldRequest = await ui.promise;
+    await session.answer(oldRequest.id, { value: "finish" });
+    assert.equal(await first, "final:stale-ui");
+    ui = Promise.withResolvers<UiRequest>();
+    const next = session.prompt("next-ui");
+    const request = await ui.promise;
+    delivery.reject(new Error("old UI delivery failed"));
+    await session.state();
+    assert.equal(session.busy, true);
+    await session.answer(request.id, { value: "finish" });
+    assert.equal(await next, "final:next-ui");
+  } finally {
+    delivery.resolve();
+    await session.stop();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

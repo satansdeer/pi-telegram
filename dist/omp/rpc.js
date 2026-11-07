@@ -8,6 +8,14 @@ import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 class OutcomeUnknownError extends Error {
 }
+/** Preserves a proven final answer without hiding a later RPC/lifecycle failure. */
+export class CompletedReplyError extends Error {
+    reply;
+    constructor(reply, cause) {
+        super(cause.message, { cause });
+        this.reply = reply;
+    }
+}
 /** Carries child-ownership proof without treating a failed operation as success. */
 export class SessionLifecycleError extends Error {
     shutdownConfirmed;
@@ -205,7 +213,7 @@ export class OmpSession {
         void completion.promise.catch(() => undefined);
         const turn = {
             id: `workspace-${++this.sequence}`, resolve: completion.resolve, reject: completion.reject,
-            acknowledged: false, started: false, terminal: false, settled: false, text: "", onProgress,
+            acknowledged: false, started: false, terminal: false, settled: false, onProgress,
         };
         this.turn = turn; // Admission must happen before the first await.
         try {
@@ -218,7 +226,7 @@ export class OmpSession {
         }
         catch (error) {
             const failure = error instanceof Error ? error : new Error(String(error));
-            turn.failure = failure;
+            turn.failure ??= failure;
             if (!(failure instanceof OutcomeUnknownError) && !turn.started && this.turn === turn)
                 this.turn = undefined;
             this.finishTurn(turn);
@@ -318,7 +326,7 @@ export class OmpSession {
                 const error = errorOf(frame.error, "OMP RPC request failed");
                 waiter?.reject(error);
                 if (this.turn?.id === frame.id) {
-                    this.turn.failure = error;
+                    this.turn.failure ??= error;
                     this.finishTurn(this.turn);
                 }
             }
@@ -328,47 +336,45 @@ export class OmpSession {
         const turn = this.turn;
         if (frame.type === "agent_start") {
             this.streaming = true;
-            if (turn)
+            if (turn) {
                 turn.started = true;
+                turn.terminal = false;
+                turn.message = undefined;
+            }
         }
         if (frame.type === "message_end" && turn?.started && record(frame.message) && frame.message.role === "assistant") {
-            turn.text = textOf(frame.message);
-            if (frame.message.stopReason === "toolUse" && turn.text.trim())
-                turn.onProgress?.(turn.text);
-            if (frame.message.stopReason === "error")
-                turn.failure = errorOf(frame.message.errorMessage, "OMP provider request failed");
-            if (frame.message.stopReason === "aborted")
-                turn.failure = new Error("OMP prompt was aborted");
+            turn.message = frame.message;
+            if (frame.message.stopReason === "toolUse") {
+                const text = textOf(frame.message);
+                if (text.trim())
+                    turn.onProgress?.(text);
+            }
         }
         if (frame.type === "agent_end" && frame.isTerminal !== false) {
             this.streaming = false;
             if (turn?.started) {
                 turn.terminal = true;
                 const last = lastAssistant(frame.messages);
-                if (last) {
-                    turn.text = textOf(last);
-                    if (last.stopReason === "error")
-                        turn.failure = errorOf(last.errorMessage, "OMP provider request failed");
-                    if (last.stopReason === "aborted")
-                        turn.failure = new Error("OMP prompt was aborted");
-                }
+                if (last)
+                    turn.message = last;
                 this.finishTurn(turn);
             }
         }
         if (frame.type === "prompt_result" && turn && frame.id === turn.id) {
             turn.result = frame;
             if (frame.status !== "completed")
-                turn.failure = errorOf(frame.error, frame.status === "aborted" ? "OMP prompt was aborted" : "OMP prompt failed");
+                turn.failure ??= errorOf(frame.error, frame.status === "aborted" ? "OMP prompt was aborted" : "OMP prompt failed");
             this.finishTurn(turn);
         }
         if (frame.type === "rpc_frame_error")
             this.fail(new Error("OMP RPC output exceeded the transport limit; outcome unknown"));
         if (frame.type === "extension_ui_request" && typeof frame.id === "string" && typeof frame.method === "string") {
             const request = frame;
+            const owner = turn;
             void Promise.resolve().then(() => this.onUi(request)).catch((error) => {
-                if (this.turn) {
-                    this.turn.failure = errorOf(error instanceof Error ? error.message : error, "OMP UI delivery failed");
-                    this.finishTurn(this.turn);
+                if (owner && this.turn === owner) {
+                    owner.failure ??= errorOf(error instanceof Error ? error.message : error, "OMP UI delivery failed");
+                    this.finishTurn(owner);
                 }
                 void this.answer(request.id, { cancelled: true }).catch(() => undefined);
             });
@@ -395,13 +401,20 @@ export class OmpSession {
     }
     finishTurn(turn) {
         const local = turn.result?.agentInvoked === false;
-        if (turn.failure && !turn.settled) {
+        // Provider message errors can be followed by an automatic retry. Only the terminal
+        // assistant outcome, or an authoritative RPC/UI/transport failure, settles failure.
+        const message = turn.message;
+        const failure = turn.failure ?? (turn.terminal && message?.stopReason === "error"
+            ? errorOf(message.errorMessage, "OMP provider request failed")
+            : turn.terminal && message?.stopReason === "aborted" ? new Error("OMP prompt was aborted") : undefined);
+        if (failure && !turn.settled) {
             turn.settled = true;
-            turn.reject(turn.failure);
+            turn.reject(turn.terminal && message?.stopReason === "stop" && turn.result?.status !== "aborted"
+                ? new CompletedReplyError(textOf(message), failure) : failure);
         }
         if (!turn.settled && turn.acknowledged && turn.result?.status === "completed" && (local || turn.terminal)) {
             turn.settled = true;
-            turn.resolve(local ? "" : turn.text);
+            turn.resolve(local || message?.stopReason !== "stop" ? "" : textOf(message));
         }
         // A timeout rejects the caller but cannot release the slot: the child may have admitted the prompt.
         if (turn.settled && (turn.terminal || local || (turn.result && !turn.started)) && this.turn === turn)
@@ -412,7 +425,10 @@ export class OmpSession {
         for (const waiter of this.pending.values())
             waiter.reject(this.failure);
         this.pending.clear();
-        this.turn?.reject(this.failure);
+        if (this.turn) {
+            this.turn.failure ??= this.failure;
+            this.finishTurn(this.turn);
+        }
         this.turn = undefined;
         if (this.sidecar && !this.sidecar.settled)
             this.sidecar.reject(this.failure);

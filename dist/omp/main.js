@@ -219,6 +219,7 @@ else {
                 updates = await api("getUpdates", { offset: bridge.offset, timeout: 25, allowed_updates: ["message"] });
             }
             catch (error) {
+            await bridge.retryDeliveries();
                 if (stopping)
                     break;
                 if (error instanceof TelegramError && [401, 403, 409].includes(error.code))
